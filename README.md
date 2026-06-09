@@ -98,6 +98,16 @@ cmake --build build -j
   --python-path "$PWD:/path/to/venv/lib/python3.12/site-packages"
 ```
 
+The native converter surface is started in `convert.py`. Today `--dry-run`
+validates the full HF -> native tensor-name map for both model sizes; writing
+GGUF requires the optional `gguf` Python module and the native runtime loader is
+still under construction.
+
+```bash
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot --dry-run
+python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
