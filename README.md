@@ -115,6 +115,7 @@ python convert.py /path/to/Qwen3-ASR-0.6B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-meta.gguf --metadata-only
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-conv0.gguf --include-tensor-prefix audio.conv.0.
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-cnn.gguf --include-tensor-prefix audio.conv. --include-tensor-prefix audio.conv_out.
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
@@ -164,6 +165,16 @@ the original HF checkpoint tensors:
 python benchmarks/check_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav
 ```
 
+The native audio CNN frontend is available as `qwen-asr-audio-cnn`. It runs the
+three downsampling Conv2D+GELU layers and `conv_out`, producing
+`[chunk, frame, hidden]` embeddings before positional embeddings and the audio
+transformer:
+
+```bash
+./build/qwen-asr-audio-cnn qwen3-asr-0.6b-audio-cnn.gguf sample.wav --out audio-cnn.f32
+python benchmarks/check_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
@@ -191,6 +202,7 @@ python benchmarks/profile_torch.py sample.wav --size 0.6B --language English
 python benchmarks/compare_parakeet.py sample.wav --qwen-size 0.6B
 python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --language English
 python benchmarks/bench_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav --torch-device cpu
+python benchmarks/bench_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -230,6 +242,12 @@ graph path is correct but not yet competitive: with 8 CPU threads,
 next native speed target clear: avoid per-call graph/setup/output-copy overhead
 and move the remaining audio tower into reusable GGML/backend graphs.
 
+For the larger audio CNN plus `conv_out` slice, `benchmarks/bench_audio_cnn.py`
+measured roughly 540 ms best for C++ GGML with 8 CPU threads, 97 ms for Torch
+CPU FP32, and 2.43 ms for Torch CUDA BF16. This validates the native tensor
+layout through the frontend projection and shows the current native CPU graph is
+not yet an end-to-end speed win.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -249,7 +267,8 @@ The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
 CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
 the C++ surface and comparison harness, and the native path now covers GGUF
 metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
-BPE prompt expansion. It also has a mapped GGUF tensor-data loader and validated
-scalar and GGML implementations of the first audio Conv2D layer. The remaining
-native work is to port the rest of the ASR audio tower/projector and Qwen3
-decoder/KV cache into GGML.
+BPE prompt expansion. It also has a mapped GGUF tensor-data loader, validated
+scalar and GGML implementations of the first audio Conv2D layer, and a validated
+GGML implementation of the three-layer audio CNN plus `conv_out`. The remaining
+native work is to port the audio transformer/projector and Qwen3 decoder/KV
+cache into GGML.

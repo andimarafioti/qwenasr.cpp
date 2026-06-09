@@ -298,3 +298,153 @@ bool qwenasr_audio_conv0_forward_ggml(
     *out = std::move(result);
     return true;
 }
+
+bool qwenasr_audio_cnn_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    QwenAsrAudioCnnOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_audio_cnn_forward_ggml: out is null");
+        return false;
+    }
+    if (!validate_features(features, "qwenasr_audio_cnn_forward_ggml", error)) {
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+
+    QwenAsrGgufTensorView w0;
+    QwenAsrGgufTensorView b0;
+    QwenAsrGgufTensorView w1;
+    QwenAsrGgufTensorView b1;
+    QwenAsrGgufTensorView w2;
+    QwenAsrGgufTensorView b2;
+    QwenAsrGgufTensorView wout;
+    if (!require_f32_tensor(model, "audio.conv.0.weight", &w0, error) ||
+        !require_f32_tensor(model, "audio.conv.0.bias", &b0, error) ||
+        !require_f32_tensor(model, "audio.conv.1.weight", &w1, error) ||
+        !require_f32_tensor(model, "audio.conv.1.bias", &b1, error) ||
+        !require_f32_tensor(model, "audio.conv.2.weight", &w2, error) ||
+        !require_f32_tensor(model, "audio.conv.2.bias", &b2, error) ||
+        !require_f32_tensor(model, "audio.conv_out.weight", &wout, error)) {
+        return false;
+    }
+
+    const int channels = static_cast<int>(w0.ne[3]);
+    if (channels <= 0 ||
+        !shape_eq(w0, { 3, 3, 1, channels }) ||
+        !shape_eq(b0, { channels }) ||
+        !shape_eq(w1, { 3, 3, channels, channels }) ||
+        !shape_eq(b1, { channels }) ||
+        !shape_eq(w2, { 3, 3, channels, channels }) ||
+        !shape_eq(b2, { channels })) {
+        set_error(error, "audio CNN tensor shape mismatch");
+        return false;
+    }
+
+    const QwenAsrAudioGeometry geometry = qwenasr_audio_geometry(features.n_frames);
+    const int chunks = geometry.n_chunks;
+    const int frames_in = geometry.max_chunk_input_len;
+    const int freq_out = conv_stride2_pad1_len(conv_stride2_pad1_len(conv_stride2_pad1_len(features.n_mels)));
+    const int frames_out = qwenasr_audio_output_length(frames_in);
+    const int conv_out_width = channels * freq_out;
+    if (chunks <= 0 || frames_in <= 0 || freq_out <= 0 || frames_out <= 0) {
+        set_error(error, "audio CNN output geometry is empty");
+        return false;
+    }
+    if (wout.ne.size() != 2 || wout.ne[0] != conv_out_width || wout.ne[1] <= 0) {
+        set_error(error, "audio.conv_out tensor shape mismatch");
+        return false;
+    }
+    const int hidden = static_cast<int>(wout.ne[1]);
+
+    QwenAsrAudioCnnOutput result;
+    result.chunks = chunks;
+    result.frames = frames_out;
+    result.hidden = hidden;
+    result.chunk_input_lengths = geometry.chunk_input_lengths;
+    result.chunk_output_lengths = geometry.chunk_output_lengths;
+    result.values.assign(
+        static_cast<size_t>(chunks) * frames_out * hidden,
+        0.0f);
+
+    std::vector<float> input_values(
+        static_cast<size_t>(frames_in) * features.n_mels * chunks,
+        0.0f);
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const int chunk_len = result.chunk_input_lengths[static_cast<size_t>(chunk)];
+        for (int mel = 0; mel < features.n_mels; ++mel) {
+            for (int frame = 0; frame < chunk_len; ++frame) {
+                const int src_frame = chunk * geometry.chunk_window + frame;
+                if (src_frame >= features.n_frames) {
+                    continue;
+                }
+                const size_t dst =
+                    static_cast<size_t>(frame) +
+                    static_cast<size_t>(frames_in) *
+                        (static_cast<size_t>(mel) + static_cast<size_t>(features.n_mels) * chunk);
+                input_values[dst] = features.values[static_cast<size_t>(mel) * features.n_frames + src_frame];
+            }
+        }
+    }
+
+    const size_t ctx_size = 1536ull * 1024ull * 1024ull;
+    std::vector<uint8_t> ctx_buffer(ctx_size);
+    ggml_init_params params;
+    params.mem_size = ctx_buffer.size();
+    params.mem_buffer = ctx_buffer.data();
+    params.no_alloc = false;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize GGML context for audio CNN");
+        return false;
+    }
+
+    ggml_tensor * tw0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, channels);
+    ggml_tensor * tb0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, channels, 1);
+    ggml_tensor * tw1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, channels, channels);
+    ggml_tensor * tb1 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, channels, 1);
+    ggml_tensor * tw2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, channels, channels);
+    ggml_tensor * tb2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, channels, 1);
+    ggml_tensor * tout = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_out_width, hidden);
+    ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, frames_in, features.n_mels, 1, chunks);
+    std::memcpy(tw0->data, w0.data, ggml_nbytes(tw0));
+    std::memcpy(tb0->data, b0.data, ggml_nbytes(tb0));
+    std::memcpy(tw1->data, w1.data, ggml_nbytes(tw1));
+    std::memcpy(tb1->data, b1.data, ggml_nbytes(tb1));
+    std::memcpy(tw2->data, w2.data, ggml_nbytes(tw2));
+    std::memcpy(tb2->data, b2.data, ggml_nbytes(tb2));
+    std::memcpy(tout->data, wout.data, ggml_nbytes(tout));
+    std::memcpy(x->data, input_values.data(), ggml_nbytes(x));
+
+    auto conv_gelu = [&](ggml_tensor * input, ggml_tensor * weight, ggml_tensor * bias) -> ggml_tensor * {
+        ggml_tensor * y = ggml_conv_2d(ctx, weight, input, 2, 2, 1, 1, 1, 1);
+        y = ggml_add(ctx, y, ggml_repeat(ctx, bias, y));
+        return ggml_gelu_erf(ctx, y);
+    };
+
+    ggml_tensor * y = conv_gelu(x, tw0, tb0);
+    y = conv_gelu(y, tw1, tb1);
+    y = conv_gelu(y, tw2, tb2);
+    y = ggml_cont(ctx, ggml_permute(ctx, y, 2, 0, 1, 3));
+    y = ggml_reshape_2d(ctx, y, conv_out_width, frames_out * chunks);
+    y = ggml_mul_mat(ctx, tout, y);
+    y = ggml_reshape_3d(ctx, y, hidden, frames_out, chunks);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    const ggml_status status = ggml_graph_compute_with_ctx(ctx, graph, n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        set_error(error, "GGML audio CNN graph compute failed");
+        return false;
+    }
+
+    std::memcpy(result.values.data(), ggml_get_data_f32(y), result.values.size() * sizeof(float));
+    ggml_free(ctx);
+    *out = std::move(result);
+    return true;
+}

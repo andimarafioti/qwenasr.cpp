@@ -66,3 +66,7 @@ qwenasr_compile_options(qwen-asr-weights)
 add_executable(qwen-asr-audio-conv tools/qwen-asr-audio-conv.cpp)
 target_link_libraries(qwen-asr-audio-conv PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-audio-conv)
+
+add_executable(qwen-asr-audio-cnn tools/qwen-asr-audio-cnn.cpp)
+target_link_libraries(qwen-asr-audio-cnn PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-audio-cnn)
