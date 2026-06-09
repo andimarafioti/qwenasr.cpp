@@ -124,6 +124,16 @@ The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
 ./build/qwen-asr-gguf-info qwen3-asr-0.6b-f32.gguf
 ```
 
+The native mapped-weight loader is available as `qwen-asr-weights`. It validates
+that tensor data ranges fit inside the GGUF file and exposes tensor data pointers
+for the future GGML graph loaders:
+
+```bash
+./build/qwen-asr-weights --self-test
+./build/qwen-asr-weights qwen3-asr-0.6b-meta.gguf --allow-metadata-only
+./build/qwen-asr-weights qwen3-asr-0.6b-f32.gguf --tensor text.token_embd.weight
+```
+
 The native tokenizer loader is available as `qwen-asr-tokenize`. It reads the
 qwentts-style `tokenizer.ggml.*` GGUF metadata, expands the ASR audio prompt,
 and can be checked against the HF tokenizer:
@@ -219,5 +229,6 @@ The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
 CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
 the C++ surface and comparison harness, and the native path now covers GGUF
 metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
-BPE prompt expansion. The remaining native work is to port the ASR audio
+BPE prompt expansion. It also has a mapped GGUF tensor-data loader ready for
+the future graph weights. The remaining native work is to port the ASR audio
 tower/projector and Qwen3 decoder/KV cache into GGML.
