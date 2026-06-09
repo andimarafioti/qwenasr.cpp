@@ -21,7 +21,7 @@ static void usage(const char * argv0) {
         << "       " << argv0 << " model.gguf audio.wav [--language NAME] [--system TEXT]\n"
         << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched] [--layer N]\n"
         << "       " << argv0 << " model.gguf audio.wav --prefill [--out next-token-logits.f32]\n"
-        << "       " << argv0 << " model.gguf audio.wav --generate N\n"
+        << "       " << argv0 << " model.gguf audio.wav --generate N [--kv-cache]\n"
         << "\n"
         << "Run native Qwen3-ASR decoder input assembly, text prefill, or slow greedy generation.\n";
 }
@@ -105,6 +105,7 @@ int main(int argc, char ** argv) {
     std::string system_text;
     std::string audio_backend = "sched";
     bool prefill = false;
+    bool use_kv_cache = false;
     int generate_tokens = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -114,6 +115,10 @@ int main(int argc, char ** argv) {
         }
         if (arg == "--prefill") {
             prefill = true;
+            continue;
+        }
+        if (arg == "--kv-cache") {
+            use_kv_cache = true;
             continue;
         }
         if (arg == "--generate") {
@@ -212,6 +217,10 @@ int main(int argc, char ** argv) {
     }
     if (prefill && generate_tokens >= 0) {
         std::cerr << "--prefill and --generate are mutually exclusive\n";
+        return 2;
+    }
+    if (use_kv_cache && generate_tokens < 0) {
+        std::cerr << "--kv-cache requires --generate\n";
         return 2;
     }
 
@@ -334,21 +343,37 @@ int main(int argc, char ** argv) {
             static_cast<int32_t>(cfg.token_endoftext),
             static_cast<int32_t>(cfg.tokenizer_eos),
         };
-        const bool generate_ok = qwenasr_text_generate_greedy_cpu(
-            model,
-            decoder_input,
-            generate_tokens,
-            static_cast<int>(cfg.text_num_hidden_layers),
-            static_cast<int>(cfg.text_num_attention_heads),
-            static_cast<int>(cfg.text_num_key_value_heads),
-            static_cast<int>(cfg.text_head_dim),
-            static_cast<int>(cfg.text_intermediate_size),
-            static_cast<int>(cfg.text_vocab_size),
-            cfg.text_rope_theta,
-            cfg.text_rms_norm_eps,
-            stop_ids,
-            &generated,
-            &error);
+        const bool generate_ok = use_kv_cache ?
+            qwenasr_text_generate_cached_cpu(
+                model,
+                decoder_input,
+                generate_tokens,
+                static_cast<int>(cfg.text_num_hidden_layers),
+                static_cast<int>(cfg.text_num_attention_heads),
+                static_cast<int>(cfg.text_num_key_value_heads),
+                static_cast<int>(cfg.text_head_dim),
+                static_cast<int>(cfg.text_intermediate_size),
+                static_cast<int>(cfg.text_vocab_size),
+                cfg.text_rope_theta,
+                cfg.text_rms_norm_eps,
+                stop_ids,
+                &generated,
+                &error) :
+            qwenasr_text_generate_greedy_cpu(
+                model,
+                decoder_input,
+                generate_tokens,
+                static_cast<int>(cfg.text_num_hidden_layers),
+                static_cast<int>(cfg.text_num_attention_heads),
+                static_cast<int>(cfg.text_num_key_value_heads),
+                static_cast<int>(cfg.text_head_dim),
+                static_cast<int>(cfg.text_intermediate_size),
+                static_cast<int>(cfg.text_vocab_size),
+                cfg.text_rope_theta,
+                cfg.text_rms_norm_eps,
+                stop_ids,
+                &generated,
+                &error);
         const auto generate_end = std::chrono::steady_clock::now();
         qwenasr_gguf_model_close(&model);
         if (!generate_ok) {
@@ -367,6 +392,7 @@ int main(int argc, char ** argv) {
 
         std::cout << "backend=cpu\n";
         std::cout << "mode=generate\n";
+        std::cout << "decode_backend=" << (use_kv_cache ? "kv-cache" : "recompute") << "\n";
         std::cout << "audio_backend=" << audio_backend << "\n";
         std::cout << "threads=" << n_threads << "\n";
         std::cout << "init_ms=" << init_ms << "\n";

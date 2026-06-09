@@ -70,3 +70,19 @@ bool qwenasr_text_generate_greedy_cpu(
     const std::vector<int32_t> & stop_ids,
     QwenAsrTextGenerateOutput * out,
     std::string * error);
+
+bool qwenasr_text_generate_cached_cpu(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int max_new_tokens,
+    int n_layers,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    const std::vector<int32_t> & stop_ids,
+    QwenAsrTextGenerateOutput * out,
+    std::string * error);

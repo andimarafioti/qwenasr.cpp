@@ -19,6 +19,7 @@ def _dump_native_generate(
     audio: Path,
     n_threads: int,
     audio_backend: str,
+    decode_backend: str,
     max_new_tokens: int,
     system: str,
     language: str,
@@ -34,6 +35,8 @@ def _dump_native_generate(
         "--generate",
         str(max_new_tokens),
     ]
+    if decode_backend == "kv-cache":
+        cmd.append("--kv-cache")
     if system:
         cmd += ["--system", system]
     if language:
@@ -117,6 +120,7 @@ def main() -> int:
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
+    parser.add_argument("--native-decode-backend", choices=("recompute", "kv-cache"), default="recompute")
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
@@ -135,6 +139,7 @@ def main() -> int:
         args.audio,
         args.threads,
         args.audio_backend,
+        args.native_decode_backend,
         args.max_new_tokens,
         args.system,
         args.language,
@@ -157,6 +162,7 @@ def main() -> int:
     print(f"torch_text_json={json.dumps(torch_text)}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
     print(f"native_generate_ms={float(meta['generate_ms']):.3f}")
+    print(f"native_decode_backend={meta['decode_backend']}")
     print(f"native_stopped={meta['stopped']}")
     if native_ids != torch_ids:
         raise SystemExit(f"generated id mismatch: native={native_ids} torch={torch_ids}")
