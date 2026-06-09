@@ -120,6 +120,7 @@ python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-layer
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-full.gguf --include-tensor-prefix audio.
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-decoder-input.gguf --include-tensor-prefix audio. --include-tensor-prefix text.token_embd.weight
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-text-layer0.gguf --include-tensor-prefix audio. --include-tensor-prefix text.token_embd.weight --include-tensor-prefix text.blk.0.
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-text-full.gguf --include-tensor-prefix audio. --include-tensor-prefix text.
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
@@ -229,17 +230,21 @@ python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --native-audio-backend sched
 ```
 
-The first Qwen3 text decoder block is available as `qwen-asr-text-layer`. It
-builds the decoder input embeddings, then runs one scalar CPU Qwen3 block with
-RMSNorm, Q/K/V projection, per-head Q/K RMSNorm, RoPE, grouped-query causal
-attention, output projection, and SwiGLU MLP. This is a correctness boundary for
-the future native decoder/KV-cache path; it is not yet the full autoregressive
-decoder:
+The first Qwen3 text decoder block and full prompt prefill logits are available
+as `qwen-asr-text-layer`. It builds the decoder input embeddings, then runs
+scalar CPU Qwen3 blocks with RMSNorm, Q/K/V projection, per-head Q/K RMSNorm,
+RoPE, grouped-query causal attention, output projection, and SwiGLU MLP.
+`--prefill` runs every text block plus the output RMSNorm and LM head, returning
+the next-token logits from the final prompt position. This is a correctness
+boundary for the future native decoder/KV-cache path; it is not yet the full
+autoregressive decoder:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --out text-layer0-sched.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --prefill --out next-token-logits.f32
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
+python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
 ```
 
 ## Streaming
@@ -275,6 +280,7 @@ python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-a
 python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --torch-device cpu
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --torch-device cpu
+python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -364,6 +370,15 @@ therefore currently a validated decoder boundary, not a speed win; the next
 native decoder work is moving this layer into reusable GGML/backend graphs and
 adding KV-cache single-token decoding.
 
+For the full prompt prefill logits, `benchmarks/check_text_prefill.py` matches
+the eager Torch reference at `1.34e-4` max absolute error on JFK and agrees on
+the first next-token id (`3036`). `benchmarks/bench_text_prefill.py` measured
+roughly 34.5-34.6 s for scalar C++ full text prefill with 8 CPU threads, 491 ms
+for Torch CPU FP32 with 8 threads, and 28.1 ms for Torch CUDA BF16. This covers
+all decoder layers and the LM head in native C++, but also makes the next
+optimization target concrete: reusable GGML/backend text graphs and a KV-cache
+decode loop.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -389,8 +404,8 @@ GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
 position embeddings, valid-frame packing, all audio transformer layers, post
 normalization, the audio projector, decoder input embedding assembly, and a
 qwentts.cpp-style scheduled backend for the audio CNN, transformer, and
-projector that is also wired through decoder input assembly. The first Qwen3
-text decoder block is validated as a scalar CPU path through the scheduled
-decoder input boundary.
+projector that is also wired through decoder input assembly. The Qwen3 text
+decoder is validated as a scalar CPU path through the first block and full
+prompt prefill logits, including final normalization and the LM head.
 The remaining native work is to port the Qwen3 decoder/KV cache and extend the
 persistent backend path through the remaining standalone frontend tools.

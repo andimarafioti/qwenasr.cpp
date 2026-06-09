@@ -12,6 +12,13 @@ struct QwenAsrTextLayerOutput {
     std::vector<float> values; // [token, hidden]
 };
 
+struct QwenAsrTextPrefillOutput {
+    int tokens = 0;
+    int hidden = 0;
+    int vocab = 0;
+    std::vector<float> logits; // [vocab], next-token logits from the last prompt position
+};
+
 bool qwenasr_text_layer_forward_cpu(
     const QwenAsrGgufModel & model,
     const QwenAsrDecoderInputOutput & input,
@@ -23,4 +30,18 @@ bool qwenasr_text_layer_forward_cpu(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextLayerOutput * out,
+    std::string * error);
+
+bool qwenasr_text_prefill_forward_cpu(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int n_layers,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextPrefillOutput * out,
     std::string * error);

@@ -20,8 +20,9 @@ static void usage(const char * argv0) {
         << "Usage: " << argv0 << " model.gguf audio.wav [--out text-layer0.f32] [--threads N]\n"
         << "       " << argv0 << " model.gguf audio.wav [--language NAME] [--system TEXT]\n"
         << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched] [--layer N]\n"
+        << "       " << argv0 << " model.gguf audio.wav --prefill [--out next-token-logits.f32]\n"
         << "\n"
-        << "Run native Qwen3-ASR decoder input assembly plus one Qwen3 text decoder layer.\n";
+        << "Run native Qwen3-ASR decoder input assembly plus one text layer, or full text prefill.\n";
 }
 
 static bool write_raw(const std::string & path, const std::vector<float> & values, std::string * error) {
@@ -57,11 +58,16 @@ int main(int argc, char ** argv) {
     std::string language;
     std::string system_text;
     std::string audio_backend = "sched";
+    bool prefill = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
             usage(argv[0]);
             return 0;
+        }
+        if (arg == "--prefill") {
+            prefill = true;
+            continue;
         }
         if (arg == "--out") {
             if (++i >= argc) {
@@ -150,7 +156,7 @@ int main(int argc, char ** argv) {
         std::cerr << error << "\n";
         return 1;
     }
-    if (layer < 0 || layer >= static_cast<int>(cfg.text_num_hidden_layers)) {
+    if (!prefill && (layer < 0 || layer >= static_cast<int>(cfg.text_num_hidden_layers))) {
         std::cerr << "--layer is out of range for model\n";
         return 2;
     }
@@ -253,6 +259,76 @@ int main(int argc, char ** argv) {
         qwenasr_gguf_model_close(&model);
         std::cerr << error << "\n";
         return 1;
+    }
+
+    if (prefill) {
+        QwenAsrTextPrefillOutput prefill_out;
+        const auto prefill_start = std::chrono::steady_clock::now();
+        const bool prefill_ok = qwenasr_text_prefill_forward_cpu(
+            model,
+            decoder_input,
+            static_cast<int>(cfg.text_num_hidden_layers),
+            static_cast<int>(cfg.text_num_attention_heads),
+            static_cast<int>(cfg.text_num_key_value_heads),
+            static_cast<int>(cfg.text_head_dim),
+            static_cast<int>(cfg.text_intermediate_size),
+            static_cast<int>(cfg.text_vocab_size),
+            cfg.text_rope_theta,
+            cfg.text_rms_norm_eps,
+            &prefill_out,
+            &error);
+        const auto prefill_end = std::chrono::steady_clock::now();
+        qwenasr_gguf_model_close(&model);
+        if (!prefill_ok) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        if (!out_path.empty() && !write_raw(out_path, prefill_out.logits, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        double sum = 0.0;
+        float min_value = std::numeric_limits<float>::infinity();
+        float max_value = -std::numeric_limits<float>::infinity();
+        int top_id = -1;
+        float top_value = -std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < prefill_out.logits.size(); ++i) {
+            const float value = prefill_out.logits[i];
+            min_value = std::min(min_value, value);
+            max_value = std::max(max_value, value);
+            if (value > top_value) {
+                top_value = value;
+                top_id = static_cast<int>(i);
+            }
+            sum += value;
+        }
+
+        const double decoder_input_ms = std::chrono::duration<double, std::milli>(decoder_end - decoder_start).count();
+        const double prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
+
+        std::cout << "backend=cpu\n";
+        std::cout << "mode=prefill\n";
+        std::cout << "audio_backend=" << audio_backend << "\n";
+        std::cout << "threads=" << n_threads << "\n";
+        std::cout << "init_ms=" << init_ms << "\n";
+        std::cout << "decoder_input_ms=" << decoder_input_ms << "\n";
+        std::cout << "prefill_ms=" << prefill_ms << "\n";
+        std::cout << "sample_rate=" << sample_rate << "\n";
+        std::cout << "samples=" << samples.size() << "\n";
+        std::cout << "feature_frames=" << features.n_frames << "\n";
+        std::cout << "layers=" << cfg.text_num_hidden_layers << "\n";
+        std::cout << "tokens=" << prefill_out.tokens << "\n";
+        std::cout << "hidden=" << prefill_out.hidden << "\n";
+        std::cout << "vocab=" << prefill_out.vocab << "\n";
+        std::cout << "values=" << prefill_out.logits.size() << "\n";
+        std::cout << "top_id=" << top_id << "\n";
+        std::cout << "top_logit=" << top_value << "\n";
+        std::cout << "min=" << min_value << "\n";
+        std::cout << "max=" << max_value << "\n";
+        std::cout << "mean=" << (sum / static_cast<double>(prefill_out.logits.size())) << "\n";
+        return 0;
     }
 
     QwenAsrTextLayerOutput text_layer;

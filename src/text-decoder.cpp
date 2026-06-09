@@ -179,9 +179,11 @@ static void apply_rope(
     }
 }
 
-bool qwenasr_text_layer_forward_cpu(
+static bool text_layer_forward_values_cpu(
     const QwenAsrGgufModel & model,
-    const QwenAsrDecoderInputOutput & input,
+    const std::vector<float> & input_values,
+    int tokens,
+    int hidden,
     int layer,
     int n_heads,
     int n_kv_heads,
@@ -189,19 +191,17 @@ bool qwenasr_text_layer_forward_cpu(
     int intermediate,
     float rope_theta,
     float rms_norm_eps,
-    QwenAsrTextLayerOutput * out,
+    std::vector<float> * out_values,
     std::string * error) {
-    if (!out) {
-        set_error(error, "qwenasr_text_layer_forward_cpu: out is null");
+    if (!out_values) {
+        set_error(error, "text_layer_forward_values_cpu: out_values is null");
         return false;
     }
-    const int tokens = input.tokens;
-    const int hidden = input.hidden;
     const int q_dim = n_heads * head_dim;
     const int kv_dim = n_kv_heads * head_dim;
     if (tokens <= 0 || hidden <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
         head_dim <= 0 || intermediate <= 0 || n_heads % n_kv_heads != 0 ||
-        q_dim <= 0 || kv_dim <= 0 || input.values.size() != static_cast<size_t>(tokens) * hidden) {
+        q_dim <= 0 || kv_dim <= 0 || input_values.size() != static_cast<size_t>(tokens) * hidden) {
         set_error(error, "invalid text layer configuration");
         return false;
     }
@@ -215,7 +215,7 @@ bool qwenasr_text_layer_forward_cpu(
     const float * attn_norm_w = tensor_f32(tensors.attn_norm_w);
     for (int token = 0; token < tokens; ++token) {
         rms_norm_row(
-            input.values.data() + static_cast<size_t>(token) * hidden,
+            input_values.data() + static_cast<size_t>(token) * hidden,
             hidden,
             attn_norm_w,
             rms_norm_eps,
@@ -302,7 +302,7 @@ bool qwenasr_text_layer_forward_cpu(
 
     std::vector<float> hidden_states(static_cast<size_t>(tokens) * hidden, 0.0f);
     for (size_t i = 0; i < hidden_states.size(); ++i) {
-        hidden_states[i] = input.values[i] + projected[i];
+        hidden_states[i] = input_values[i] + projected[i];
     }
 
     const float * ffn_norm_w = tensor_f32(tensors.ffn_norm_w);
@@ -329,10 +329,131 @@ bool qwenasr_text_layer_forward_cpu(
         hidden_states[i] += down[i];
     }
 
+    *out_values = std::move(hidden_states);
+    return true;
+}
+
+bool qwenasr_text_layer_forward_cpu(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int layer,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextLayerOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_layer_forward_cpu: out is null");
+        return false;
+    }
+
     QwenAsrTextLayerOutput result;
-    result.tokens = tokens;
-    result.hidden = hidden;
-    result.values = std::move(hidden_states);
+    result.tokens = input.tokens;
+    result.hidden = input.hidden;
+    if (!text_layer_forward_values_cpu(
+            model,
+            input.values,
+            input.tokens,
+            input.hidden,
+            layer,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate,
+            rope_theta,
+            rms_norm_eps,
+            &result.values,
+            error)) {
+        return false;
+    }
+    *out = std::move(result);
+    return true;
+}
+
+bool qwenasr_text_prefill_forward_cpu(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int n_layers,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextPrefillOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_prefill_forward_cpu: out is null");
+        return false;
+    }
+    if (input.tokens <= 0 || input.hidden <= 0 || n_layers <= 0 || vocab <= 0 ||
+        input.values.size() != static_cast<size_t>(input.tokens) * input.hidden) {
+        set_error(error, "invalid text prefill configuration");
+        return false;
+    }
+
+    std::vector<float> states = input.values;
+    std::vector<float> next;
+    for (int layer = 0; layer < n_layers; ++layer) {
+        if (!text_layer_forward_values_cpu(
+                model,
+                states,
+                input.tokens,
+                input.hidden,
+                layer,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                intermediate,
+                rope_theta,
+                rms_norm_eps,
+                &next,
+                error)) {
+            return false;
+        }
+        states = std::move(next);
+        next.clear();
+    }
+
+    QwenAsrGgufTensorView norm_w;
+    QwenAsrGgufTensorView output_w;
+    if (!require_f32_tensor(model, "text.output_norm.weight", &norm_w, error) ||
+        !require_f32_tensor(model, "text.output.weight", &output_w, error)) {
+        return false;
+    }
+    if (!require_shape(norm_w, input.hidden, error) ||
+        !require_shape(output_w, input.hidden, vocab, error)) {
+        return false;
+    }
+
+    std::vector<float> normed(static_cast<size_t>(input.hidden), 0.0f);
+    rms_norm_row(
+        states.data() + static_cast<size_t>(input.tokens - 1) * input.hidden,
+        input.hidden,
+        tensor_f32(norm_w),
+        rms_norm_eps,
+        normed.data());
+
+    const float * w = tensor_f32(output_w);
+    std::vector<float> logits(static_cast<size_t>(vocab), 0.0f);
+    for (int token = 0; token < vocab; ++token) {
+        const float * ww = w + static_cast<size_t>(token) * input.hidden;
+        float sum = 0.0f;
+        for (int i = 0; i < input.hidden; ++i) {
+            sum += normed[static_cast<size_t>(i)] * ww[i];
+        }
+        logits[static_cast<size_t>(token)] = sum;
+    }
+
+    QwenAsrTextPrefillOutput result;
+    result.tokens = input.tokens;
+    result.hidden = input.hidden;
+    result.vocab = vocab;
+    result.logits = std::move(logits);
     *out = std::move(result);
     return true;
 }
