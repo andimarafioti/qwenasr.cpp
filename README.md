@@ -250,7 +250,7 @@ native decoder backend path; it is not yet the fast GGML autoregressive decoder:
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
 python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
-python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2 --native-decode-backend kv-cache
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-decode-backend kv-cache
 ```
 
 ## Streaming
@@ -287,7 +287,7 @@ python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --torch-device cpu
-python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2 --cpp-decode-backends kv-cache --torch-device cpu
+python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-decode-backends kv-cache --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -387,14 +387,14 @@ optimization target concrete: reusable GGML/backend text graphs and a KV-cache
 decode loop.
 
 For greedy generation, `benchmarks/check_text_generate.py` matches the Torch
-reference for the first two JFK English tokens (`3036,773`, decoded as `And so`)
-with both the recompute and scalar KV-cache native paths. The original recompute
-path took about 69.3 s for two tokens. With `--kv-cache`, the same two-token
-run measured about 34.9 s with 8 CPU threads, 984 ms for Torch CPU FP32 with 8
-threads, and 82.0 ms for Torch CUDA BF16. This is now an end-to-end native
-audio-to-token/text path with cached scalar decode after prompt prefill, but it
-still highlights the remaining qwentts.cpp-style work: persistent GGML/backend
-text graphs and a fast KV-cache single-token decode loop.
+reference for the first four JFK English tokens (`3036,773,11,847`, decoded as
+`And so, my`) with the scalar KV-cache native path. The original recompute path
+took about 69.3 s for just two tokens. With `--kv-cache`, a four-token run
+measured about 35.8 s with 8 CPU threads, compared with 3.20 s for Torch CPU
+FP32 with 8 threads. This is now an end-to-end native audio-to-token/text path
+with cached scalar decode after prompt prefill, but it still highlights the
+remaining qwentts.cpp-style work: persistent GGML/backend text graphs and a fast
+KV-cache single-token decode loop.
 
 ## Implementation Notes
 

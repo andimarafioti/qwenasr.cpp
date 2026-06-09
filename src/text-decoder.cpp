@@ -77,6 +77,13 @@ struct TextLayerKvCache {
     std::vector<float> v; // [token, kv_head * head_dim]
 };
 
+struct TextDecoderTensorContext {
+    std::vector<TextLayerTensors> layers;
+    QwenAsrGgufTensorView embd_w;
+    QwenAsrGgufTensorView output_norm_w;
+    QwenAsrGgufTensorView output_w;
+};
+
 static bool load_text_layer_tensors(
     const QwenAsrGgufModel & model,
     int layer,
@@ -114,6 +121,53 @@ static bool load_text_layer_tensors(
         require_shape(tensors->gate_w, hidden, intermediate, error) &&
         require_shape(tensors->up_w, hidden, intermediate, error) &&
         require_shape(tensors->down_w, intermediate, hidden, error);
+}
+
+static bool load_text_decoder_tensor_context(
+    const QwenAsrGgufModel & model,
+    int n_layers,
+    int hidden,
+    int q_dim,
+    int kv_dim,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    TextDecoderTensorContext * tensors,
+    std::string * error) {
+    if (!tensors || n_layers <= 0) {
+        set_error(error, "invalid text decoder tensor context configuration");
+        return false;
+    }
+
+    TextDecoderTensorContext result;
+    result.layers.resize(static_cast<size_t>(n_layers));
+    for (int layer = 0; layer < n_layers; ++layer) {
+        if (!load_text_layer_tensors(
+                model,
+                layer,
+                hidden,
+                q_dim,
+                kv_dim,
+                head_dim,
+                intermediate,
+                &result.layers[static_cast<size_t>(layer)],
+                error)) {
+            return false;
+        }
+    }
+    if (!require_f32_tensor(model, "text.token_embd.weight", &result.embd_w, error) ||
+        !require_f32_tensor(model, "text.output_norm.weight", &result.output_norm_w, error) ||
+        !require_f32_tensor(model, "text.output.weight", &result.output_w, error)) {
+        return false;
+    }
+    if (!require_shape(result.embd_w, hidden, vocab, error) ||
+        !require_shape(result.output_norm_w, hidden, error) ||
+        !require_shape(result.output_w, hidden, vocab, error)) {
+        return false;
+    }
+
+    *tensors = std::move(result);
+    return true;
 }
 
 static void rms_norm_row(
@@ -223,6 +277,7 @@ static bool text_layer_forward_values_cpu(
     int tokens,
     int hidden,
     int layer,
+    const TextLayerTensors * loaded_tensors,
     int n_heads,
     int n_kv_heads,
     int head_dim,
@@ -245,10 +300,15 @@ static bool text_layer_forward_values_cpu(
         return false;
     }
 
-    TextLayerTensors tensors;
-    if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &tensors, error)) {
-        return false;
+    TextLayerTensors local_tensors;
+    const TextLayerTensors * tensors_ptr = loaded_tensors;
+    if (!tensors_ptr) {
+        if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &local_tensors, error)) {
+            return false;
+        }
+        tensors_ptr = &local_tensors;
     }
+    const TextLayerTensors & tensors = *tensors_ptr;
 
     std::vector<float> normed(static_cast<size_t>(tokens) * hidden, 0.0f);
     const float * attn_norm_w = tensor_f32(tensors.attn_norm_w);
@@ -385,6 +445,8 @@ static bool compute_logits_for_state_cpu(
     int hidden,
     int vocab,
     float rms_norm_eps,
+    const QwenAsrGgufTensorView * loaded_norm_w,
+    const QwenAsrGgufTensorView * loaded_output_w,
     std::vector<float> * logits,
     std::string * error) {
     if (!state || !logits || hidden <= 0 || vocab <= 0) {
@@ -392,21 +454,27 @@ static bool compute_logits_for_state_cpu(
         return false;
     }
 
-    QwenAsrGgufTensorView norm_w;
-    QwenAsrGgufTensorView output_w;
-    if (!require_f32_tensor(model, "text.output_norm.weight", &norm_w, error) ||
-        !require_f32_tensor(model, "text.output.weight", &output_w, error)) {
-        return false;
+    QwenAsrGgufTensorView local_norm_w;
+    QwenAsrGgufTensorView local_output_w;
+    const QwenAsrGgufTensorView * norm_w = loaded_norm_w;
+    const QwenAsrGgufTensorView * output_w = loaded_output_w;
+    if (!norm_w || !output_w) {
+        if (!require_f32_tensor(model, "text.output_norm.weight", &local_norm_w, error) ||
+            !require_f32_tensor(model, "text.output.weight", &local_output_w, error)) {
+            return false;
+        }
+        norm_w = &local_norm_w;
+        output_w = &local_output_w;
     }
-    if (!require_shape(norm_w, hidden, error) ||
-        !require_shape(output_w, hidden, vocab, error)) {
+    if (!require_shape(*norm_w, hidden, error) ||
+        !require_shape(*output_w, hidden, vocab, error)) {
         return false;
     }
 
     std::vector<float> normed(static_cast<size_t>(hidden), 0.0f);
-    rms_norm_row(state, hidden, tensor_f32(norm_w), rms_norm_eps, normed.data());
+    rms_norm_row(state, hidden, tensor_f32(*norm_w), rms_norm_eps, normed.data());
 
-    const float * w = tensor_f32(output_w);
+    const float * w = tensor_f32(*output_w);
     logits->assign(static_cast<size_t>(vocab), 0.0f);
     for (int token = 0; token < vocab; ++token) {
         const float * ww = w + static_cast<size_t>(token) * hidden;
@@ -423,6 +491,7 @@ static bool text_layer_decode_cached_cpu(
     const QwenAsrGgufModel & model,
     const std::vector<float> & input_state,
     int layer,
+    const TextLayerTensors * loaded_tensors,
     int n_heads,
     int n_kv_heads,
     int head_dim,
@@ -448,10 +517,15 @@ static bool text_layer_decode_cached_cpu(
         return false;
     }
 
-    TextLayerTensors tensors;
-    if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &tensors, error)) {
-        return false;
+    TextLayerTensors local_tensors;
+    const TextLayerTensors * tensors_ptr = loaded_tensors;
+    if (!tensors_ptr) {
+        if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &local_tensors, error)) {
+            return false;
+        }
+        tensors_ptr = &local_tensors;
     }
+    const TextLayerTensors & tensors = *tensors_ptr;
 
     std::vector<float> normed(static_cast<size_t>(hidden), 0.0f);
     rms_norm_row(input_state.data(), hidden, tensor_f32(tensors.attn_norm_w), rms_norm_eps, normed.data());
@@ -581,6 +655,7 @@ bool qwenasr_text_layer_forward_cpu(
             input.tokens,
             input.hidden,
             layer,
+            nullptr,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -628,6 +703,7 @@ bool qwenasr_text_prefill_forward_cpu(
                 input.tokens,
                 input.hidden,
                 layer,
+                nullptr,
                 n_heads,
                 n_kv_heads,
                 head_dim,
@@ -650,6 +726,8 @@ bool qwenasr_text_prefill_forward_cpu(
             input.hidden,
             vocab,
             rms_norm_eps,
+            nullptr,
+            nullptr,
             &logits,
             error)) {
         return false;
@@ -799,15 +877,6 @@ bool qwenasr_text_generate_cached_cpu(
         return false;
     }
 
-    QwenAsrGgufTensorView embd;
-    if (!require_f32_tensor(model, "text.token_embd.weight", &embd, error)) {
-        return false;
-    }
-    if (!require_shape(embd, input.hidden, vocab, error)) {
-        return false;
-    }
-    const float * embedding = tensor_f32(embd);
-
     QwenAsrTextGenerateOutput result;
     result.prompt_tokens = input.tokens;
     result.total_tokens = input.tokens;
@@ -819,10 +888,27 @@ bool qwenasr_text_generate_cached_cpu(
         return true;
     }
 
+    const int q_dim = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    TextDecoderTensorContext tensors;
+    if (!load_text_decoder_tensor_context(
+            model,
+            n_layers,
+            input.hidden,
+            q_dim,
+            kv_dim,
+            head_dim,
+            intermediate,
+            vocab,
+            &tensors,
+            error)) {
+        return false;
+    }
+    const float * embedding = tensor_f32(tensors.embd_w);
+
     std::vector<TextLayerKvCache> caches(static_cast<size_t>(n_layers));
     std::vector<float> states = input.values;
     std::vector<float> next;
-    const int kv_dim = n_kv_heads * head_dim;
     for (int layer = 0; layer < n_layers; ++layer) {
         if (!text_layer_forward_values_cpu(
                 model,
@@ -830,6 +916,7 @@ bool qwenasr_text_generate_cached_cpu(
                 input.tokens,
                 input.hidden,
                 layer,
+                &tensors.layers[static_cast<size_t>(layer)],
                 n_heads,
                 n_kv_heads,
                 head_dim,
@@ -856,6 +943,8 @@ bool qwenasr_text_generate_cached_cpu(
             input.hidden,
             vocab,
             rms_norm_eps,
+            &tensors.output_norm_w,
+            &tensors.output_w,
             &logits,
             error)) {
         return false;
@@ -902,6 +991,7 @@ bool qwenasr_text_generate_cached_cpu(
                     model,
                     state,
                     layer,
+                    &tensors.layers[static_cast<size_t>(layer)],
                     n_heads,
                     n_kv_heads,
                     head_dim,
@@ -922,6 +1012,8 @@ bool qwenasr_text_generate_cached_cpu(
                 input.hidden,
                 vocab,
                 rms_norm_eps,
+                &tensors.output_norm_w,
+                &tensors.output_w,
                 &logits,
                 error)) {
             return false;
