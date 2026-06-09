@@ -21,6 +21,8 @@ struct QwenAsrAudioEncoderOutput {
     std::vector<float> values; // [token, hidden]
 };
 
+struct QwenAsrAudioEncoderBackend;
+
 bool qwenasr_audio_layer0_forward_cpu(
     const QwenAsrGgufModel & model,
     const QwenAsrFeatures & features,
@@ -45,4 +47,22 @@ bool qwenasr_audio_layer0_forward_ggml(
     int n_threads,
     int n_heads,
     QwenAsrAudioLayerOutput * out,
+    std::string * error);
+
+bool qwenasr_audio_encoder_backend_init(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int n_heads,
+    int hidden,
+    int output_dim,
+    QwenAsrAudioEncoderBackend ** out,
+    std::string * error);
+
+void qwenasr_audio_encoder_backend_free(QwenAsrAudioEncoderBackend * backend);
+
+bool qwenasr_audio_encoder_backend_forward(
+    QwenAsrAudioEncoderBackend * backend,
+    const QwenAsrAudioPrepOutput & prep,
+    QwenAsrAudioEncoderOutput * out,
     std::string * error);

@@ -6,6 +6,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
 #endif
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -497,6 +498,92 @@ struct AudioProjectorTensors {
     QwenAsrGgufTensorView proj1_b;
 };
 
+struct BackendPendingCopy {
+    ggml_tensor * tensor = nullptr;
+    const void * data = nullptr;
+    size_t nbytes = 0;
+};
+
+struct BackendAudioLayerTensors {
+    ggml_tensor * attn_norm_w = nullptr;
+    ggml_tensor * attn_norm_b = nullptr;
+    ggml_tensor * ffn_norm_w = nullptr;
+    ggml_tensor * ffn_norm_b = nullptr;
+    ggml_tensor * q_w = nullptr;
+    ggml_tensor * q_b = nullptr;
+    ggml_tensor * k_w = nullptr;
+    ggml_tensor * k_b = nullptr;
+    ggml_tensor * v_w = nullptr;
+    ggml_tensor * v_b = nullptr;
+    ggml_tensor * out_w = nullptr;
+    ggml_tensor * out_b = nullptr;
+    ggml_tensor * up_w = nullptr;
+    ggml_tensor * up_b = nullptr;
+    ggml_tensor * down_w = nullptr;
+    ggml_tensor * down_b = nullptr;
+};
+
+struct BackendAudioProjectorTensors {
+    ggml_tensor * post_norm_w = nullptr;
+    ggml_tensor * post_norm_b = nullptr;
+    ggml_tensor * proj0_w = nullptr;
+    ggml_tensor * proj0_b = nullptr;
+    ggml_tensor * proj1_w = nullptr;
+    ggml_tensor * proj1_b = nullptr;
+};
+
+struct QwenAsrAudioEncoderBackend {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context * weight_ctx = nullptr;
+    ggml_backend_buffer_t weight_buffer = nullptr;
+    int n_threads = 1;
+    int n_layers = 0;
+    int n_heads = 0;
+    int hidden = 0;
+    int output_dim = 0;
+    std::vector<BackendAudioLayerTensors> layers;
+    BackendAudioProjectorTensors projector;
+};
+
+static ggml_tensor * new_backend_weight_from_view(
+    ggml_context * ctx,
+    const QwenAsrGgufTensorView & view,
+    std::vector<BackendPendingCopy> * pending) {
+    ggml_tensor * tensor = ggml_new_tensor(
+        ctx,
+        view.type,
+        static_cast<int>(view.ne.size()),
+        view.ne.data());
+    ggml_set_name(tensor, view.name.c_str());
+    pending->push_back(BackendPendingCopy { tensor, view.data, ggml_nbytes(tensor) });
+    return tensor;
+}
+
+static BackendAudioLayerTensors backend_audio_layer_tensors_from_views(
+    ggml_context * ctx,
+    const AudioLayerTensors & views,
+    std::vector<BackendPendingCopy> * pending) {
+    BackendAudioLayerTensors tensors;
+    tensors.attn_norm_w = new_backend_weight_from_view(ctx, views.attn_norm_w, pending);
+    tensors.attn_norm_b = new_backend_weight_from_view(ctx, views.attn_norm_b, pending);
+    tensors.ffn_norm_w = new_backend_weight_from_view(ctx, views.ffn_norm_w, pending);
+    tensors.ffn_norm_b = new_backend_weight_from_view(ctx, views.ffn_norm_b, pending);
+    tensors.q_w = new_backend_weight_from_view(ctx, views.q_w, pending);
+    tensors.q_b = new_backend_weight_from_view(ctx, views.q_b, pending);
+    tensors.k_w = new_backend_weight_from_view(ctx, views.k_w, pending);
+    tensors.k_b = new_backend_weight_from_view(ctx, views.k_b, pending);
+    tensors.v_w = new_backend_weight_from_view(ctx, views.v_w, pending);
+    tensors.v_b = new_backend_weight_from_view(ctx, views.v_b, pending);
+    tensors.out_w = new_backend_weight_from_view(ctx, views.out_w, pending);
+    tensors.out_b = new_backend_weight_from_view(ctx, views.out_b, pending);
+    tensors.up_w = new_backend_weight_from_view(ctx, views.up_w, pending);
+    tensors.up_b = new_backend_weight_from_view(ctx, views.up_b, pending);
+    tensors.down_w = new_backend_weight_from_view(ctx, views.down_w, pending);
+    tensors.down_b = new_backend_weight_from_view(ctx, views.down_b, pending);
+    return tensors;
+}
+
 static bool load_audio_projector_tensors(
     const QwenAsrGgufModel & model,
     int hidden,
@@ -519,6 +606,259 @@ static bool load_audio_projector_tensors(
         !require_shape(tensors->proj1_b, output_dim, error)) {
         return false;
     }
+    return true;
+}
+
+static BackendAudioProjectorTensors backend_audio_projector_tensors_from_views(
+    ggml_context * ctx,
+    const AudioProjectorTensors & views,
+    std::vector<BackendPendingCopy> * pending) {
+    BackendAudioProjectorTensors tensors;
+    tensors.post_norm_w = new_backend_weight_from_view(ctx, views.post_norm_w, pending);
+    tensors.post_norm_b = new_backend_weight_from_view(ctx, views.post_norm_b, pending);
+    tensors.proj0_w = new_backend_weight_from_view(ctx, views.proj0_w, pending);
+    tensors.proj0_b = new_backend_weight_from_view(ctx, views.proj0_b, pending);
+    tensors.proj1_w = new_backend_weight_from_view(ctx, views.proj1_w, pending);
+    tensors.proj1_b = new_backend_weight_from_view(ctx, views.proj1_b, pending);
+    return tensors;
+}
+
+static ggml_tensor * backend_audio_layer_forward_ggml(
+    ggml_context * ctx,
+    const BackendAudioLayerTensors & tensors,
+    ggml_tensor * x,
+    int hidden,
+    int n_heads) {
+    const int tokens = static_cast<int>(x->ne[1]);
+    const int head_dim = hidden / n_heads;
+
+    ggml_tensor * normed = layer_norm_ggml(ctx, x, tensors.attn_norm_w, tensors.attn_norm_b);
+    ggml_tensor * q = linear_ggml(ctx, normed, tensors.q_w, tensors.q_b);
+    ggml_tensor * k = linear_ggml(ctx, normed, tensors.k_w, tensors.k_b);
+    ggml_tensor * v = linear_ggml(ctx, normed, tensors.v_w, tensors.v_b);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, tokens);
+    k = ggml_reshape_3d(ctx, k, head_dim, n_heads, tokens);
+    v = ggml_reshape_3d(ctx, v, head_dim, n_heads, tokens);
+
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
+
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, hidden, tokens);
+
+    ggml_tensor * projected = linear_ggml(ctx, attn, tensors.out_w, tensors.out_b);
+    ggml_tensor * hidden_states = ggml_add(ctx, x, projected);
+
+    ggml_tensor * ffn_normed = layer_norm_ggml(ctx, hidden_states, tensors.ffn_norm_w, tensors.ffn_norm_b);
+    ggml_tensor * ffn_up = linear_ggml(ctx, ffn_normed, tensors.up_w, tensors.up_b);
+    ffn_up = ggml_gelu_erf(ctx, ffn_up);
+    ggml_tensor * ffn_down = linear_ggml(ctx, ffn_up, tensors.down_w, tensors.down_b);
+    return ggml_add(ctx, hidden_states, ffn_down);
+}
+
+static ggml_tensor * backend_audio_projector_forward_ggml(
+    ggml_context * ctx,
+    const BackendAudioProjectorTensors & tensors,
+    ggml_tensor * x) {
+    ggml_tensor * y = layer_norm_ggml(ctx, x, tensors.post_norm_w, tensors.post_norm_b);
+    y = linear_ggml(ctx, y, tensors.proj0_w, tensors.proj0_b);
+    y = ggml_gelu_erf(ctx, y);
+    return linear_ggml(ctx, y, tensors.proj1_w, tensors.proj1_b);
+}
+
+void qwenasr_audio_encoder_backend_free(QwenAsrAudioEncoderBackend * backend) {
+    if (!backend) {
+        return;
+    }
+    if (backend->sched) {
+        ggml_backend_sched_free(backend->sched);
+        backend->sched = nullptr;
+    }
+    if (backend->weight_buffer) {
+        ggml_backend_buffer_free(backend->weight_buffer);
+        backend->weight_buffer = nullptr;
+    }
+    if (backend->weight_ctx) {
+        ggml_free(backend->weight_ctx);
+        backend->weight_ctx = nullptr;
+    }
+    if (backend->backend) {
+        ggml_backend_free(backend->backend);
+        backend->backend = nullptr;
+    }
+    delete backend;
+}
+
+bool qwenasr_audio_encoder_backend_init(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int n_heads,
+    int hidden,
+    int output_dim,
+    QwenAsrAudioEncoderBackend ** out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_audio_encoder_backend_init: out is null");
+        return false;
+    }
+    *out = nullptr;
+    if (n_layers <= 0 || n_heads <= 0 || hidden <= 0 || output_dim <= 0 || hidden % n_heads != 0) {
+        set_error(error, "invalid audio encoder backend configuration");
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+
+    QwenAsrAudioEncoderBackend * runtime = new QwenAsrAudioEncoderBackend();
+    runtime->n_threads = n_threads;
+    runtime->n_layers = n_layers;
+    runtime->n_heads = n_heads;
+    runtime->hidden = hidden;
+    runtime->output_dim = output_dim;
+
+    runtime->backend = ggml_backend_cpu_init();
+    if (!runtime->backend) {
+        qwenasr_audio_encoder_backend_free(runtime);
+        set_error(error, "failed to initialize GGML CPU backend");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
+
+    constexpr size_t max_nodes = 4096;
+    ggml_backend_t backends[] = { runtime->backend };
+    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    if (!runtime->sched) {
+        qwenasr_audio_encoder_backend_free(runtime);
+        set_error(error, "failed to initialize GGML backend scheduler");
+        return false;
+    }
+
+    const int n_weight_tensors = n_layers * 16 + 6;
+    const size_t weight_ctx_size = static_cast<size_t>(n_weight_tensors) * ggml_tensor_overhead() + 1024ull * 1024ull;
+    ggml_init_params params;
+    params.mem_size = weight_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    runtime->weight_ctx = ggml_init(params);
+    if (!runtime->weight_ctx) {
+        qwenasr_audio_encoder_backend_free(runtime);
+        set_error(error, "failed to initialize audio encoder weight context");
+        return false;
+    }
+
+    std::vector<BackendPendingCopy> pending;
+    pending.reserve(static_cast<size_t>(n_weight_tensors));
+    runtime->layers.reserve(static_cast<size_t>(n_layers));
+    for (int layer = 0; layer < n_layers; ++layer) {
+        AudioLayerTensors views;
+        if (!load_audio_layer_tensors(model, layer, hidden, &views, error)) {
+            qwenasr_audio_encoder_backend_free(runtime);
+            return false;
+        }
+        runtime->layers.push_back(backend_audio_layer_tensors_from_views(runtime->weight_ctx, views, &pending));
+    }
+
+    AudioProjectorTensors projector_views;
+    if (!load_audio_projector_tensors(model, hidden, output_dim, &projector_views, error)) {
+        qwenasr_audio_encoder_backend_free(runtime);
+        return false;
+    }
+    runtime->projector = backend_audio_projector_tensors_from_views(runtime->weight_ctx, projector_views, &pending);
+
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    if (!runtime->weight_buffer) {
+        qwenasr_audio_encoder_backend_free(runtime);
+        set_error(error, "failed to allocate audio encoder backend weight buffer");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(runtime->weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    for (const BackendPendingCopy & copy : pending) {
+        ggml_backend_tensor_set(copy.tensor, copy.data, 0, copy.nbytes);
+    }
+
+    *out = runtime;
+    return true;
+}
+
+bool qwenasr_audio_encoder_backend_forward(
+    QwenAsrAudioEncoderBackend * backend,
+    const QwenAsrAudioPrepOutput & prep,
+    QwenAsrAudioEncoderOutput * out,
+    std::string * error) {
+    if (!backend || !out) {
+        set_error(error, "qwenasr_audio_encoder_backend_forward: backend or out is null");
+        return false;
+    }
+    if (prep.tokens <= 0 || prep.hidden != backend->hidden ||
+        prep.values.size() != static_cast<size_t>(prep.tokens) * prep.hidden) {
+        set_error(error, "invalid audio prep input for backend encoder");
+        return false;
+    }
+
+    constexpr size_t max_nodes = 4096;
+    const size_t graph_ctx_size =
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    ggml_init_params params;
+    params.mem_size = graph_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize audio encoder graph context");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, backend->hidden, prep.tokens);
+    ggml_set_name(x, "audio_encoder_input");
+    ggml_set_input(x);
+
+    ggml_tensor * y = x;
+    for (int layer = 0; layer < backend->n_layers; ++layer) {
+        y = backend_audio_layer_forward_ggml(ctx, backend->layers[static_cast<size_t>(layer)], y, backend->hidden, backend->n_heads);
+    }
+    y = backend_audio_projector_forward_ggml(ctx, backend->projector, y);
+    ggml_set_name(y, "audio_encoder_output");
+    ggml_set_output(y);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, y);
+    if (!ggml_backend_sched_alloc_graph(backend->sched, graph)) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend audio encoder graph allocation failed");
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, prep.values.data(), 0, prep.values.size() * sizeof(float));
+    const ggml_status status = ggml_backend_sched_graph_compute(backend->sched, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend audio encoder graph compute failed");
+        return false;
+    }
+
+    QwenAsrAudioEncoderOutput result;
+    result.tokens = prep.tokens;
+    result.hidden = backend->output_dim;
+    result.attention_segments = prep.attention_segments;
+    result.values.assign(static_cast<size_t>(prep.tokens) * backend->output_dim, 0.0f);
+    ggml_backend_tensor_get(y, result.values.data(), 0, result.values.size() * sizeof(float));
+
+    ggml_backend_sched_reset(backend->sched);
+    ggml_free(ctx);
+    *out = std::move(result);
     return true;
 }
 

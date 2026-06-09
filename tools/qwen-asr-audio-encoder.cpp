@@ -16,6 +16,7 @@
 static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out encoder.f32] [--threads N]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched]\n"
         << "\n"
         << "Run native Qwen3-ASR audio CNN, transformer encoder, and projector.\n";
 }
@@ -49,6 +50,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string audio_path;
     std::string out_path;
+    std::string backend = "ggml";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -61,6 +63,18 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             out_path = argv[i];
+            continue;
+        }
+        if (arg == "--backend") {
+            if (++i >= argc) {
+                std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
+            backend = argv[i];
+            if (backend != "ggml" && backend != "sched") {
+                std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
             continue;
         }
         if (arg == "--threads") {
@@ -120,17 +134,48 @@ int main(int argc, char ** argv) {
     }
 
     QwenAsrAudioEncoderOutput encoder;
-    const auto encoder_start = std::chrono::steady_clock::now();
-    const bool encoder_ok = qwenasr_audio_encoder_forward_ggml(
-        model,
-        features,
-        n_threads,
-        static_cast<int>(cfg.audio_encoder_layers),
-        static_cast<int>(cfg.audio_encoder_attention_heads),
-        static_cast<int>(cfg.audio_output_dim),
-        &encoder,
-        &error);
-    const auto encoder_end = std::chrono::steady_clock::now();
+    double init_ms = 0.0;
+    auto encoder_start = std::chrono::steady_clock::now();
+    auto encoder_end = encoder_start;
+    bool encoder_ok = false;
+    if (backend == "ggml") {
+        encoder_ok = qwenasr_audio_encoder_forward_ggml(
+            model,
+            features,
+            n_threads,
+            static_cast<int>(cfg.audio_encoder_layers),
+            static_cast<int>(cfg.audio_encoder_attention_heads),
+            static_cast<int>(cfg.audio_output_dim),
+            &encoder,
+            &error);
+        encoder_end = std::chrono::steady_clock::now();
+    } else {
+        const auto init_start = std::chrono::steady_clock::now();
+        QwenAsrAudioEncoderBackend * encoder_backend = nullptr;
+        if (!qwenasr_audio_encoder_backend_init(
+                model,
+                n_threads,
+                static_cast<int>(cfg.audio_encoder_layers),
+                static_cast<int>(cfg.audio_encoder_attention_heads),
+                static_cast<int>(cfg.audio_d_model),
+                static_cast<int>(cfg.audio_output_dim),
+                &encoder_backend,
+                &error)) {
+            qwenasr_gguf_model_close(&model);
+            std::cerr << error << "\n";
+            return 1;
+        }
+        const auto init_end = std::chrono::steady_clock::now();
+        init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
+
+        QwenAsrAudioPrepOutput prep;
+        encoder_start = std::chrono::steady_clock::now();
+        encoder_ok =
+            qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, &error) &&
+            qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &encoder, &error);
+        encoder_end = std::chrono::steady_clock::now();
+        qwenasr_audio_encoder_backend_free(encoder_backend);
+    }
     qwenasr_gguf_model_close(&model);
     if (!encoder_ok) {
         std::cerr << error << "\n";
@@ -154,8 +199,9 @@ int main(int argc, char ** argv) {
     const double encoder_ms =
         std::chrono::duration<double, std::milli>(encoder_end - encoder_start).count();
 
-    std::cout << "backend=ggml\n";
+    std::cout << "backend=" << backend << "\n";
     std::cout << "threads=" << n_threads << "\n";
+    std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "encoder_ms=" << encoder_ms << "\n";
     std::cout << "sample_rate=" << sample_rate << "\n";
     std::cout << "samples=" << samples.size() << "\n";
