@@ -238,11 +238,11 @@ supports `--backend scalar`, a correctness-first per-call `--backend ggml`
 graph, and a qwentts.cpp-style `--backend sched` graph that uploads layer
 weights into a GGML CPU backend buffer once. `--prefill` runs every text block
 plus the output RMSNorm and LM head, returning the next-token logits from the
-final prompt position. `--generate N` adds a minimal greedy loop that decodes
-generated token ids back to text; `--kv-cache` keeps scalar per-layer K/V
-tensors from prompt prefill and runs following tokens through a one-row cached
-decode. Prefill and generation are still scalar text paths, so this is not yet
-the fast GGML autoregressive decoder:
+final prompt position; it supports the scalar text path and `--backend sched`.
+`--generate N` adds a minimal greedy loop that decodes generated token ids back
+to text; `--kv-cache` keeps scalar per-layer K/V tensors from prompt prefill and
+runs following tokens through a one-row cached decode. Generation is still a
+scalar text path, so this is not yet the fast GGML autoregressive decoder:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
@@ -250,12 +250,14 @@ the fast GGML autoregressive decoder:
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend ggml --out text-layer0-ggml.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend sched --out text-layer0-backend.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --prefill --out next-token-logits.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --backend sched --prefill --out next-token-logits-sched.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --out native-prefix.txt
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --kv-cache --out native-prefix-cache.txt
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend ggml
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend sched
 python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
+python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --native-backend sched
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-decode-backend kv-cache
 ```
@@ -293,7 +295,7 @@ python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-a
 python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --torch-device cpu
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --cpp-backends scalar ggml sched --torch-device cpu
-python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --torch-device cpu
+python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --cpp-backends scalar sched --torch-device cpu
 python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-decode-backends kv-cache --torch-device cpu
 ```
 
@@ -384,16 +386,17 @@ scheduled GGML backend after a 14.0 ms one-time text weight upload, and 14.4 ms
 best for Torch CPU FP32 with 8 threads. The scheduled GGML layer is now close to
 Torch CPU for this prompt-sized block and much faster than the current scalar
 C++ layer; the next native decoder work is extending the reusable backend
-through prompt prefill and KV-cache single-token decoding.
+through KV-cache single-token decoding.
 
 For the full prompt prefill logits, `benchmarks/check_text_prefill.py` matches
-the eager Torch reference at `1.34e-4` max absolute error on JFK and agrees on
-the first next-token id (`3036`). `benchmarks/bench_text_prefill.py` measured
-roughly 34.5-34.6 s for scalar C++ full text prefill with 8 CPU threads, 491 ms
-for Torch CPU FP32 with 8 threads, and 28.1 ms for Torch CUDA BF16. This covers
-all decoder layers and the LM head in native C++, but also makes the next
-optimization target concrete: reusable GGML/backend text graphs and a KV-cache
-decode loop.
+the eager Torch reference at `1.34e-4` max absolute error for the scalar path and
+`1.33e-4` for the scheduled GGML backend on JFK, and both agree on the first
+next-token id (`3036`). `benchmarks/bench_text_prefill.py` measured roughly
+34.9 s for scalar C++ full text prefill with 8 CPU threads, 494 ms for the
+scheduled GGML backend after a 781 ms one-time text weight upload, and 479 ms
+for Torch CPU FP32 with 8 threads. This now covers all decoder layers and the LM
+head in reusable native GGML/backend graphs; the next optimization target is a
+scheduled KV-cache single-token decode loop.
 
 For greedy generation, `benchmarks/check_text_generate.py` matches the Torch
 reference for the first four JFK English tokens (`3036,773,11,847`, decoded as

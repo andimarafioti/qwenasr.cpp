@@ -29,6 +29,7 @@ struct QwenAsrTextGenerateOutput {
 };
 
 struct QwenAsrTextLayerBackend;
+struct QwenAsrTextDecoderBackend;
 
 bool qwenasr_text_layer_forward_cpu(
     const QwenAsrGgufModel & model,
@@ -77,6 +78,29 @@ bool qwenasr_text_layer_backend_forward(
     QwenAsrTextLayerBackend * backend,
     const QwenAsrDecoderInputOutput & input,
     QwenAsrTextLayerOutput * out,
+    std::string * error);
+
+bool qwenasr_text_decoder_backend_init(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextDecoderBackend ** out,
+    std::string * error);
+
+void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend);
+
+bool qwenasr_text_prefill_backend_forward(
+    QwenAsrTextDecoderBackend * backend,
+    const QwenAsrDecoderInputOutput & input,
+    QwenAsrTextPrefillOutput * out,
     std::string * error);
 
 bool qwenasr_text_prefill_forward_cpu(

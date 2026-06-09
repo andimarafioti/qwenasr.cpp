@@ -236,8 +236,12 @@ int main(int argc, char ** argv) {
         std::cerr << "--kv-cache requires --generate\n";
         return 2;
     }
-    if ((prefill || generate_tokens >= 0) && text_backend != "scalar") {
-        std::cerr << "--backend ggml/sched currently supports layer mode only\n";
+    if (generate_tokens >= 0 && text_backend != "scalar") {
+        std::cerr << "--backend ggml/sched currently does not support generation\n";
+        return 2;
+    }
+    if (prefill && text_backend == "ggml") {
+        std::cerr << "--backend ggml currently supports layer mode only\n";
         return 2;
     }
 
@@ -440,21 +444,55 @@ int main(int argc, char ** argv) {
 
     if (prefill) {
         QwenAsrTextPrefillOutput prefill_out;
+        double text_init_ms = 0.0;
+        QwenAsrTextDecoderBackend * text_decoder_backend = nullptr;
+        if (text_backend == "sched") {
+            const auto text_init_start = std::chrono::steady_clock::now();
+            const bool init_ok = qwenasr_text_decoder_backend_init(
+                model,
+                n_threads,
+                static_cast<int>(cfg.text_num_hidden_layers),
+                decoder_input.hidden,
+                static_cast<int>(cfg.text_num_attention_heads),
+                static_cast<int>(cfg.text_num_key_value_heads),
+                static_cast<int>(cfg.text_head_dim),
+                static_cast<int>(cfg.text_intermediate_size),
+                static_cast<int>(cfg.text_vocab_size),
+                cfg.text_rope_theta,
+                cfg.text_rms_norm_eps,
+                &text_decoder_backend,
+                &error);
+            const auto text_init_end = std::chrono::steady_clock::now();
+            text_init_ms = std::chrono::duration<double, std::milli>(text_init_end - text_init_start).count();
+            if (!init_ok) {
+                qwenasr_gguf_model_close(&model);
+                std::cerr << error << "\n";
+                return 1;
+            }
+        }
+
         const auto prefill_start = std::chrono::steady_clock::now();
-        const bool prefill_ok = qwenasr_text_prefill_forward_cpu(
-            model,
-            decoder_input,
-            static_cast<int>(cfg.text_num_hidden_layers),
-            static_cast<int>(cfg.text_num_attention_heads),
-            static_cast<int>(cfg.text_num_key_value_heads),
-            static_cast<int>(cfg.text_head_dim),
-            static_cast<int>(cfg.text_intermediate_size),
-            static_cast<int>(cfg.text_vocab_size),
-            cfg.text_rope_theta,
-            cfg.text_rms_norm_eps,
-            &prefill_out,
-            &error);
+        const bool prefill_ok = text_backend == "sched" ?
+            qwenasr_text_prefill_backend_forward(
+                text_decoder_backend,
+                decoder_input,
+                &prefill_out,
+                &error) :
+            qwenasr_text_prefill_forward_cpu(
+                model,
+                decoder_input,
+                static_cast<int>(cfg.text_num_hidden_layers),
+                static_cast<int>(cfg.text_num_attention_heads),
+                static_cast<int>(cfg.text_num_key_value_heads),
+                static_cast<int>(cfg.text_head_dim),
+                static_cast<int>(cfg.text_intermediate_size),
+                static_cast<int>(cfg.text_vocab_size),
+                cfg.text_rope_theta,
+                cfg.text_rms_norm_eps,
+                &prefill_out,
+                &error);
         const auto prefill_end = std::chrono::steady_clock::now();
+        qwenasr_text_decoder_backend_free(text_decoder_backend);
         qwenasr_gguf_model_close(&model);
         if (!prefill_ok) {
             std::cerr << error << "\n";
@@ -485,11 +523,12 @@ int main(int argc, char ** argv) {
         const double decoder_input_ms = std::chrono::duration<double, std::milli>(decoder_end - decoder_start).count();
         const double prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
 
-        std::cout << "backend=scalar\n";
+        std::cout << "backend=" << text_backend << "\n";
         std::cout << "mode=prefill\n";
         std::cout << "audio_backend=" << audio_backend << "\n";
         std::cout << "threads=" << n_threads << "\n";
         std::cout << "init_ms=" << init_ms << "\n";
+        std::cout << "text_init_ms=" << text_init_ms << "\n";
         std::cout << "decoder_input_ms=" << decoder_input_ms << "\n";
         std::cout << "prefill_ms=" << prefill_ms << "\n";
         std::cout << "sample_rate=" << sample_rate << "\n";

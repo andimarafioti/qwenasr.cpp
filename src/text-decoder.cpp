@@ -162,6 +162,26 @@ struct QwenAsrTextLayerBackend {
     float rms_norm_eps = 0.0f;
 };
 
+struct QwenAsrTextDecoderBackend {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context * weight_ctx = nullptr;
+    ggml_backend_buffer_t weight_buffer = nullptr;
+    std::vector<BackendTextLayerTensors> layers;
+    ggml_tensor * output_norm_w = nullptr;
+    ggml_tensor * output_w = nullptr;
+    int n_threads = 1;
+    int n_layers = 0;
+    int hidden = 0;
+    int n_heads = 0;
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    int intermediate = 0;
+    int vocab = 0;
+    float rope_theta = 0.0f;
+    float rms_norm_eps = 0.0f;
+};
+
 static bool load_text_layer_tensors(
     const QwenAsrGgufModel & model,
     int layer,
@@ -316,6 +336,25 @@ static ggml_tensor * backend_text_layer_forward_ggml(
     ggml_tensor * activated = ggml_mul(ctx, ggml_silu(ctx, gate), up);
     ggml_tensor * down = linear_ggml(ctx, activated, tensors.down_w);
     return ggml_add(ctx, hidden_states, down);
+}
+
+static ggml_tensor * backend_text_logits_ggml(
+    ggml_context * ctx,
+    ggml_tensor * states,
+    ggml_tensor * output_norm_w,
+    ggml_tensor * output_w,
+    int hidden,
+    int tokens,
+    float rms_norm_eps) {
+    ggml_tensor * last = ggml_view_2d(
+        ctx,
+        states,
+        hidden,
+        1,
+        states->nb[1],
+        static_cast<size_t>(tokens - 1) * states->nb[1]);
+    ggml_tensor * normed = rms_norm_ggml(ctx, last, output_norm_w, rms_norm_eps);
+    return linear_ggml(ctx, normed, output_w);
 }
 
 static bool load_text_decoder_tensor_context(
@@ -1206,6 +1245,241 @@ bool qwenasr_text_layer_backend_forward(
     result.hidden = input.hidden;
     result.values.assign(static_cast<size_t>(input.tokens) * input.hidden, 0.0f);
     ggml_backend_tensor_get(y, result.values.data(), 0, result.values.size() * sizeof(float));
+
+    ggml_backend_sched_reset(backend->sched);
+    ggml_free(ctx);
+    *out = std::move(result);
+    return true;
+}
+
+void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend) {
+    if (!backend) {
+        return;
+    }
+    if (backend->sched) {
+        ggml_backend_sched_free(backend->sched);
+        backend->sched = nullptr;
+    }
+    if (backend->weight_buffer) {
+        ggml_backend_buffer_free(backend->weight_buffer);
+        backend->weight_buffer = nullptr;
+    }
+    if (backend->weight_ctx) {
+        ggml_free(backend->weight_ctx);
+        backend->weight_ctx = nullptr;
+    }
+    if (backend->backend) {
+        ggml_backend_free(backend->backend);
+        backend->backend = nullptr;
+    }
+    delete backend;
+}
+
+bool qwenasr_text_decoder_backend_init(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextDecoderBackend ** out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_decoder_backend_init: out is null");
+        return false;
+    }
+    *out = nullptr;
+    const int q_dim = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    if (n_layers <= 0 || hidden <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || intermediate <= 0 || vocab <= 0 ||
+        n_heads % n_kv_heads != 0 || q_dim <= 0 || kv_dim <= 0) {
+        set_error(error, "invalid text decoder backend configuration");
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+
+    QwenAsrTextDecoderBackend * runtime = new QwenAsrTextDecoderBackend();
+    runtime->n_threads = n_threads;
+    runtime->n_layers = n_layers;
+    runtime->hidden = hidden;
+    runtime->n_heads = n_heads;
+    runtime->n_kv_heads = n_kv_heads;
+    runtime->head_dim = head_dim;
+    runtime->intermediate = intermediate;
+    runtime->vocab = vocab;
+    runtime->rope_theta = rope_theta;
+    runtime->rms_norm_eps = rms_norm_eps;
+
+    runtime->backend = ggml_backend_cpu_init();
+    if (!runtime->backend) {
+        qwenasr_text_decoder_backend_free(runtime);
+        set_error(error, "failed to initialize GGML CPU backend for text decoder");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
+
+    constexpr size_t max_nodes = 8192;
+    ggml_backend_t backends[] = { runtime->backend };
+    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    if (!runtime->sched) {
+        qwenasr_text_decoder_backend_free(runtime);
+        set_error(error, "failed to initialize GGML text decoder backend scheduler");
+        return false;
+    }
+
+    const int n_weight_tensors = n_layers * 11 + 2;
+    const size_t weight_ctx_size = static_cast<size_t>(n_weight_tensors) * ggml_tensor_overhead() + 1024ull * 1024ull;
+    ggml_init_params params;
+    params.mem_size = weight_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    runtime->weight_ctx = ggml_init(params);
+    if (!runtime->weight_ctx) {
+        qwenasr_text_decoder_backend_free(runtime);
+        set_error(error, "failed to initialize text decoder weight context");
+        return false;
+    }
+
+    std::vector<BackendPendingCopy> pending;
+    pending.reserve(static_cast<size_t>(n_weight_tensors));
+    runtime->layers.reserve(static_cast<size_t>(n_layers));
+    for (int layer = 0; layer < n_layers; ++layer) {
+        TextLayerTensors views;
+        if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &views, error)) {
+            qwenasr_text_decoder_backend_free(runtime);
+            return false;
+        }
+        runtime->layers.push_back(backend_text_layer_tensors_from_views(runtime->weight_ctx, views, &pending));
+    }
+
+    QwenAsrGgufTensorView output_norm_w;
+    QwenAsrGgufTensorView output_w;
+    if (!require_f32_tensor(model, "text.output_norm.weight", &output_norm_w, error) ||
+        !require_f32_tensor(model, "text.output.weight", &output_w, error) ||
+        !require_shape(output_norm_w, hidden, error) ||
+        !require_shape(output_w, hidden, vocab, error)) {
+        qwenasr_text_decoder_backend_free(runtime);
+        return false;
+    }
+    runtime->output_norm_w = new_backend_weight_from_view(runtime->weight_ctx, output_norm_w, &pending);
+    runtime->output_w = new_backend_weight_from_view(runtime->weight_ctx, output_w, &pending);
+
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    if (!runtime->weight_buffer) {
+        qwenasr_text_decoder_backend_free(runtime);
+        set_error(error, "failed to allocate text decoder backend weight buffer");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(runtime->weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    for (const BackendPendingCopy & copy : pending) {
+        ggml_backend_tensor_set(copy.tensor, copy.data, 0, copy.nbytes);
+    }
+
+    *out = runtime;
+    return true;
+}
+
+bool qwenasr_text_prefill_backend_forward(
+    QwenAsrTextDecoderBackend * backend,
+    const QwenAsrDecoderInputOutput & input,
+    QwenAsrTextPrefillOutput * out,
+    std::string * error) {
+    if (!backend || !out) {
+        set_error(error, "qwenasr_text_prefill_backend_forward: backend or out is null");
+        return false;
+    }
+    if (input.tokens <= 0 || input.hidden != backend->hidden ||
+        input.values.size() != static_cast<size_t>(input.tokens) * input.hidden) {
+        set_error(error, "invalid decoder input for text prefill backend");
+        return false;
+    }
+
+    constexpr size_t max_nodes = 8192;
+    const size_t graph_ctx_size =
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    ggml_init_params params;
+    params.mem_size = graph_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize text prefill graph context");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, backend->hidden, input.tokens);
+    ggml_set_name(x, "text_prefill_input");
+    ggml_set_input(x);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, input.tokens);
+    ggml_set_name(positions, "text_prefill_positions");
+    ggml_set_input(positions);
+
+    ggml_tensor * y = x;
+    for (int layer = 0; layer < backend->n_layers; ++layer) {
+        y = backend_text_layer_forward_ggml(
+            ctx,
+            backend->layers[static_cast<size_t>(layer)],
+            y,
+            positions,
+            backend->hidden,
+            backend->n_heads,
+            backend->n_kv_heads,
+            backend->head_dim,
+            backend->intermediate,
+            backend->rope_theta,
+            backend->rms_norm_eps);
+    }
+    y = backend_text_logits_ggml(
+        ctx,
+        y,
+        backend->output_norm_w,
+        backend->output_w,
+        backend->hidden,
+        input.tokens,
+        backend->rms_norm_eps);
+    ggml_set_name(y, "text_prefill_logits");
+    ggml_set_output(y);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, y);
+    if (!ggml_backend_sched_alloc_graph(backend->sched, graph)) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text prefill graph allocation failed");
+        return false;
+    }
+
+    std::vector<int32_t> positions_data(static_cast<size_t>(input.tokens), 0);
+    for (int token = 0; token < input.tokens; ++token) {
+        positions_data[static_cast<size_t>(token)] = token;
+    }
+
+    ggml_backend_tensor_set(x, input.values.data(), 0, input.values.size() * sizeof(float));
+    ggml_backend_tensor_set(positions, positions_data.data(), 0, positions_data.size() * sizeof(int32_t));
+    const ggml_status status = ggml_backend_sched_graph_compute(backend->sched, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text prefill graph compute failed");
+        return false;
+    }
+
+    QwenAsrTextPrefillOutput result;
+    result.tokens = input.tokens;
+    result.hidden = input.hidden;
+    result.vocab = backend->vocab;
+    result.logits.assign(static_cast<size_t>(backend->vocab), 0.0f);
+    ggml_backend_tensor_get(y, result.logits.data(), 0, result.logits.size() * sizeof(float));
 
     ggml_backend_sched_reset(backend->sched);
     ggml_free(ctx);

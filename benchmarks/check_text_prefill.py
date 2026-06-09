@@ -25,6 +25,7 @@ def _dump_native_prefill(
     gguf: Path,
     audio: Path,
     n_threads: int,
+    native_backend: str,
     audio_backend: str,
     system: str,
     language: str,
@@ -38,6 +39,8 @@ def _dump_native_prefill(
             str(audio),
             "--threads",
             str(n_threads),
+            "--backend",
+            native_backend,
             "--audio-backend",
             audio_backend,
             "--prefill",
@@ -115,6 +118,7 @@ def main() -> int:
     parser.add_argument("--cpp-bin", default=str(ROOT / "build" / "qwen-asr-text-layer"))
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--native-backend", choices=("scalar", "sched"), default="scalar")
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
@@ -133,6 +137,7 @@ def main() -> int:
         args.gguf,
         args.audio,
         args.threads,
+        args.native_backend,
         args.audio_backend,
         args.system,
         args.language,
@@ -154,6 +159,7 @@ def main() -> int:
     print(f"layers={int(text_cfg['num_hidden_layers'])}")
     print(f"native_backend={meta['backend']}")
     print(f"native_audio_backend={meta['audio_backend']}")
+    print(f"native_text_init_ms={float(meta.get('text_init_ms', 0.0)):.3f}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
     print(f"native_prefill_ms={float(meta['prefill_ms']):.3f}")
     print(f"native_top_id={native_top}")
