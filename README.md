@@ -35,6 +35,12 @@ For the fast vLLM backend:
 pip install "qwenasr-cpp[fast]"
 ```
 
+For checkpoint conversion utilities:
+
+```bash
+pip install "qwenasr-cpp[convert]"
+```
+
 The upstream Qwen3-ASR package currently pins `transformers==4.57.6`. Use a fresh
 environment if you already have a large ML stack installed.
 
@@ -99,20 +105,22 @@ cmake --build build -j
   --python-path "$PWD:/path/to/venv/lib/python3.12/site-packages"
 ```
 
-The native converter surface is started in `convert.py`. Today `--dry-run`
-validates the full HF -> native tensor-name map for both model sizes; writing
-GGUF requires the optional `gguf` Python module and the native runtime loader is
-still under construction.
+The native converter surface is started in `convert.py`. `--dry-run` validates
+the full HF -> native tensor-name map for both model sizes, and
+`--metadata-only` writes a small GGUF containing the real checkpoint metadata
+without the large tensors. Full tensor GGUF writing requires the `convert` extra.
 
 ```bash
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-meta.gguf --metadata-only
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
 
 ```bash
 ./build/qwen-asr-gguf-info --self-test
+./build/qwen-asr-gguf-info qwen3-asr-0.6b-meta.gguf --allow-metadata-only
 ./build/qwen-asr-gguf-info qwen3-asr-0.6b-f32.gguf
 ```
 

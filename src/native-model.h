@@ -42,8 +42,10 @@ struct QwenAsrNativeConfig {
 
 bool qwenasr_load_gguf_metadata(
     const char * path,
-    bool require_core_tensors,
+    bool require_tensors,
     QwenAsrNativeConfig * out,
     std::string * error);
 
 bool qwenasr_write_metadata_fixture(const char * path, std::string * error);
+
+std::vector<std::string> qwenasr_expected_tensor_names(const QwenAsrNativeConfig & cfg);

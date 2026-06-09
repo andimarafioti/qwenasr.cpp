@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static bool require_key(const gguf_context * ctx, const char * key, int64_t * id, std::string * error) {
     *id = gguf_find_key(ctx, key);
@@ -58,7 +59,7 @@ static bool require_tensor(const gguf_context * ctx, const char * name, std::str
 
 bool qwenasr_load_gguf_metadata(
     const char * path,
-    bool require_core_tensors,
+    bool require_tensors,
     QwenAsrNativeConfig * out,
     std::string * error) {
     if (!path || !out) {
@@ -116,12 +117,14 @@ bool qwenasr_load_gguf_metadata(
         ok = false;
     }
 
-    if (ok && require_core_tensors) {
-        ok = ok && require_tensor(ctx, "text.token_embd.weight", error);
-        ok = ok && require_tensor(ctx, "text.output_norm.weight", error);
-        ok = ok && require_tensor(ctx, "text.output.weight", error);
-        ok = ok && require_tensor(ctx, "audio.conv.0.weight", error);
-        ok = ok && require_tensor(ctx, "audio.proj.1.weight", error);
+    if (ok && require_tensors) {
+        const std::vector<std::string> expected = qwenasr_expected_tensor_names(cfg);
+        for (const std::string & name : expected) {
+            ok = require_tensor(ctx, name.c_str(), error);
+            if (!ok) {
+                break;
+            }
+        }
     }
 
     if (ok) {
@@ -135,6 +138,77 @@ bool qwenasr_load_gguf_metadata(
 
     gguf_free(ctx);
     return ok;
+}
+
+std::vector<std::string> qwenasr_expected_tensor_names(const QwenAsrNativeConfig & cfg) {
+    std::vector<std::string> names;
+    names.reserve(
+        3 + 13 +
+        static_cast<size_t>(cfg.text_num_hidden_layers) * 11 +
+        static_cast<size_t>(cfg.audio_encoder_layers) * 16);
+
+    names.push_back("text.token_embd.weight");
+    names.push_back("text.output_norm.weight");
+    names.push_back("text.output.weight");
+
+    names.push_back("audio.conv.0.weight");
+    names.push_back("audio.conv.0.bias");
+    names.push_back("audio.conv.1.weight");
+    names.push_back("audio.conv.1.bias");
+    names.push_back("audio.conv.2.weight");
+    names.push_back("audio.conv.2.bias");
+    names.push_back("audio.conv_out.weight");
+    names.push_back("audio.post_norm.weight");
+    names.push_back("audio.post_norm.bias");
+    names.push_back("audio.proj.0.weight");
+    names.push_back("audio.proj.0.bias");
+    names.push_back("audio.proj.1.weight");
+    names.push_back("audio.proj.1.bias");
+
+    static const char * text_suffixes[] = {
+        "attn_norm.weight",
+        "ffn_norm.weight",
+        "attn_q.weight",
+        "attn_k.weight",
+        "attn_v.weight",
+        "attn_output.weight",
+        "attn_q_norm.weight",
+        "attn_k_norm.weight",
+        "ffn_gate.weight",
+        "ffn_up.weight",
+        "ffn_down.weight",
+    };
+    for (uint32_t layer = 0; layer < cfg.text_num_hidden_layers; ++layer) {
+        for (const char * suffix : text_suffixes) {
+            names.push_back("text.blk." + std::to_string(layer) + "." + suffix);
+        }
+    }
+
+    static const char * audio_suffixes[] = {
+        "attn_norm.weight",
+        "attn_norm.bias",
+        "ffn_norm.weight",
+        "ffn_norm.bias",
+        "attn_q.weight",
+        "attn_q.bias",
+        "attn_k.weight",
+        "attn_k.bias",
+        "attn_v.weight",
+        "attn_v.bias",
+        "attn_output.weight",
+        "attn_output.bias",
+        "ffn_up.weight",
+        "ffn_up.bias",
+        "ffn_down.weight",
+        "ffn_down.bias",
+    };
+    for (uint32_t layer = 0; layer < cfg.audio_encoder_layers; ++layer) {
+        for (const char * suffix : audio_suffixes) {
+            names.push_back("audio.blk." + std::to_string(layer) + "." + suffix);
+        }
+    }
+
+    return names;
 }
 
 bool qwenasr_write_metadata_fixture(const char * path, std::string * error) {

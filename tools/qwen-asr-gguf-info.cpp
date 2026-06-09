@@ -40,6 +40,7 @@ static void print_config(const QwenAsrNativeConfig & cfg) {
     std::cout << "token_audio=" << cfg.token_audio << "\n";
     std::cout << "token_audio_start=" << cfg.token_audio_start << "\n";
     std::cout << "token_audio_end=" << cfg.token_audio_end << "\n";
+    std::cout << "expected_tensors=" << qwenasr_expected_tensor_names(cfg).size() << "\n";
     for (size_t i = 0; i < cfg.first_tensors.size(); ++i) {
         std::cout << "tensor." << i << "=" << cfg.first_tensors[i] << "\n";
     }

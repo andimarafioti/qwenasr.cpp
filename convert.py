@@ -166,7 +166,14 @@ def _add_metadata(writer, cfg: dict) -> None:
     writer.add_uint32("qwen3-asr.token.audio_end_token_id", thinker.get("audio_end_token_id", 151670))
 
 
-def write_gguf(checkpoint: Path, out_path: Path, tensor_map: dict[str, str], cfg: dict) -> None:
+def write_gguf(
+    checkpoint: Path,
+    out_path: Path,
+    tensor_map: dict[str, str],
+    cfg: dict,
+    *,
+    metadata_only: bool = False,
+) -> None:
     try:
         import gguf
     except Exception as exc:  # pragma: no cover - depends on optional external package
@@ -175,18 +182,20 @@ def write_gguf(checkpoint: Path, out_path: Path, tensor_map: dict[str, str], cfg
     writer = gguf.GGUFWriter(str(out_path), ARCH)
     _add_metadata(writer, cfg)
 
-    files = _iter_safetensors(checkpoint)
-    for file in files:
-        with safe_open(file, framework="pt", device="cpu") as handle:
-            for name in handle.keys():
-                tensor = handle.get_tensor(name)
-                if str(tensor.dtype) == "torch.bfloat16":
-                    tensor = tensor.float()
-                writer.add_tensor(tensor_map[name], tensor.numpy())
+    if not metadata_only:
+        files = _iter_safetensors(checkpoint)
+        for file in files:
+            with safe_open(file, framework="pt", device="cpu") as handle:
+                for name in handle.keys():
+                    tensor = handle.get_tensor(name)
+                    if str(tensor.dtype) == "torch.bfloat16":
+                        tensor = tensor.float()
+                    writer.add_tensor(tensor_map[name], tensor.numpy())
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
+    if not metadata_only:
+        writer.write_tensors_to_file()
     writer.close()
 
 
@@ -195,6 +204,11 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path, help="HF snapshot directory")
     parser.add_argument("-o", "--out", type=Path, default=None, help="output GGUF path")
     parser.add_argument("--dry-run", action="store_true", help="validate mapping without writing GGUF")
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="write only GGUF metadata; useful for validating the native loader without large tensors",
+    )
     parser.add_argument("--dump-map", type=Path, default=None, help="write JSON tensor map")
     args = parser.parse_args()
 
@@ -218,8 +232,10 @@ def main() -> int:
         print("status=dry-run-ok")
         return 0
 
-    write_gguf(args.checkpoint, args.out, tensor_map, cfg)
+    write_gguf(args.checkpoint, args.out, tensor_map, cfg, metadata_only=args.metadata_only)
     print(f"wrote={args.out}")
+    if args.metadata_only:
+        print("metadata_only=true")
     return 0
 
 
