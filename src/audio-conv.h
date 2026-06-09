@@ -25,6 +25,13 @@ struct QwenAsrAudioCnnOutput {
     std::vector<float> values; // [chunk, frame, hidden]
 };
 
+struct QwenAsrAudioPrepOutput {
+    int tokens = 0;
+    int hidden = 0;
+    std::vector<QwenAsrAudioSegment> attention_segments;
+    std::vector<float> values; // [token, hidden]
+};
+
 bool qwenasr_audio_conv0_forward(
     const QwenAsrGgufModel & model,
     const QwenAsrFeatures & features,
@@ -43,4 +50,11 @@ bool qwenasr_audio_cnn_forward_ggml(
     const QwenAsrFeatures & features,
     int n_threads,
     QwenAsrAudioCnnOutput * out,
+    std::string * error);
+
+bool qwenasr_audio_prep_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    QwenAsrAudioPrepOutput * out,
     std::string * error);

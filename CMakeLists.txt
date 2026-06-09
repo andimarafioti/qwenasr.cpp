@@ -70,3 +70,7 @@ qwenasr_compile_options(qwen-asr-audio-conv)
 add_executable(qwen-asr-audio-cnn tools/qwen-asr-audio-cnn.cpp)
 target_link_libraries(qwen-asr-audio-cnn PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-audio-cnn)
+
+add_executable(qwen-asr-audio-prep tools/qwen-asr-audio-prep.cpp)
+target_link_libraries(qwen-asr-audio-prep PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-audio-prep)

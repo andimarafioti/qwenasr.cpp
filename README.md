@@ -175,6 +175,15 @@ transformer:
 python benchmarks/check_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
 ```
 
+The pre-transformer audio prep boundary adds sinusoidal positional embeddings,
+packs only valid per-chunk frames, and reports the attention segments consumed
+by the audio transformer:
+
+```bash
+./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --out audio-prep.f32
+python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
@@ -203,6 +212,7 @@ python benchmarks/compare_parakeet.py sample.wav --qwen-size 0.6B
 python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --language English
 python benchmarks/bench_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
+python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -248,6 +258,12 @@ CPU FP32, and 2.43 ms for Torch CUDA BF16. This validates the native tensor
 layout through the frontend projection and shows the current native CPU graph is
 not yet an end-to-end speed win.
 
+At the packed pre-transformer boundary, `benchmarks/bench_audio_prep.py`
+measured roughly 647 ms best for C++ GGML with 8 CPU threads, 102 ms for Torch
+CPU FP32, and 2.46 ms for Torch CUDA BF16. The output matches PyTorch at
+`1.53e-5` max absolute error and produces the JFK attention segments
+`[(0, 104), (104, 39)]`.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -269,6 +285,6 @@ the C++ surface and comparison harness, and the native path now covers GGUF
 metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
 BPE prompt expansion. It also has a mapped GGUF tensor-data loader, validated
 scalar and GGML implementations of the first audio Conv2D layer, and a validated
-GGML implementation of the three-layer audio CNN plus `conv_out`. The remaining
-native work is to port the audio transformer/projector and Qwen3 decoder/KV
-cache into GGML.
+GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
+position embeddings, and valid-frame packing. The remaining native work is to
+port the audio transformer/projector and Qwen3 decoder/KV cache into GGML.

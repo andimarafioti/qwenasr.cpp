@@ -448,3 +448,67 @@ bool qwenasr_audio_cnn_forward_ggml(
     *out = std::move(result);
     return true;
 }
+
+bool qwenasr_audio_prep_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    QwenAsrAudioPrepOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_audio_prep_forward_ggml: out is null");
+        return false;
+    }
+
+    QwenAsrAudioCnnOutput cnn;
+    if (!qwenasr_audio_cnn_forward_ggml(model, features, n_threads, &cnn, error)) {
+        return false;
+    }
+    if (cnn.hidden <= 0 || (cnn.hidden % 2) != 0) {
+        set_error(error, "audio prep hidden size must be positive and even");
+        return false;
+    }
+
+    QwenAsrAudioPrepOutput result;
+    result.hidden = cnn.hidden;
+    result.tokens = 0;
+    for (int len : cnn.chunk_output_lengths) {
+        result.tokens += len;
+    }
+    result.values.assign(static_cast<size_t>(result.tokens) * result.hidden, 0.0f);
+    result.attention_segments = qwenasr_audio_geometry(features.n_frames).attention_segments;
+
+    const int half = result.hidden / 2;
+    const double log_timescale_increment = std::log(10000.0) / static_cast<double>(half - 1);
+    std::vector<float> positional(static_cast<size_t>(cnn.frames) * result.hidden, 0.0f);
+    for (int frame = 0; frame < cnn.frames; ++frame) {
+        for (int i = 0; i < half; ++i) {
+            const double inv_timescale = std::exp(-log_timescale_increment * static_cast<double>(i));
+            const double scaled_time = static_cast<double>(frame) * inv_timescale;
+            positional[static_cast<size_t>(frame) * result.hidden + i] = static_cast<float>(std::sin(scaled_time));
+            positional[static_cast<size_t>(frame) * result.hidden + half + i] = static_cast<float>(std::cos(scaled_time));
+        }
+    }
+
+    size_t token = 0;
+    for (int chunk = 0; chunk < cnn.chunks; ++chunk) {
+        const int valid_frames = cnn.chunk_output_lengths[static_cast<size_t>(chunk)];
+        for (int frame = 0; frame < valid_frames; ++frame) {
+            const size_t src =
+                (static_cast<size_t>(chunk) * cnn.frames + frame) * cnn.hidden;
+            const size_t pos = static_cast<size_t>(frame) * cnn.hidden;
+            const size_t dst = token * result.hidden;
+            for (int hidden = 0; hidden < result.hidden; ++hidden) {
+                result.values[dst + hidden] = cnn.values[src + hidden] + positional[pos + hidden];
+            }
+            ++token;
+        }
+    }
+    if (token != static_cast<size_t>(result.tokens)) {
+        set_error(error, "audio prep token count mismatch");
+        return false;
+    }
+
+    *out = std::move(result);
+    return true;
+}
