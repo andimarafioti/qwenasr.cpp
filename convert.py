@@ -15,7 +15,10 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-from safetensors import safe_open
+try:
+    from safetensors import safe_open
+except ModuleNotFoundError:  # pragma: no cover - exercised only without optional deps
+    safe_open = None
 
 
 ARCH = "qwen3-asr"
@@ -125,15 +128,124 @@ def _rename_audio_layer(name: str) -> str:
     return f"audio.blk.{layer}.{mapping[rest]}"
 
 
-def collect_tensor_map(files: Iterable[Path]) -> dict[str, str]:
+def _audio_conv_freq_bins(mel_bins: int) -> int:
+    bins = mel_bins
+    bins = (bins + 1) // 2
+    bins = (bins + 1) // 2
+    bins = (bins + 1) // 2
+    return bins
+
+
+def expected_hf_shapes(cfg: dict) -> dict[str, tuple[int, ...]]:
+    thinker = cfg.get("thinker_config", cfg)
+    text = thinker["text_config"]
+    audio = thinker["audio_config"]
+
+    text_hidden = text["hidden_size"]
+    text_q_dim = text["num_attention_heads"] * text["head_dim"]
+    text_kv_dim = text["num_key_value_heads"] * text["head_dim"]
+    text_intermediate = text["intermediate_size"]
+    text_vocab = text["vocab_size"]
+    audio_hidden = audio["d_model"]
+    audio_downsample = audio["downsample_hidden_size"]
+    audio_ffn = audio["encoder_ffn_dim"]
+    audio_output = audio["output_dim"]
+    audio_conv_out = audio_downsample * _audio_conv_freq_bins(audio["num_mel_bins"])
+
+    shapes: dict[str, tuple[int, ...]] = {
+        "text.token_embd.weight": (text_vocab, text_hidden),
+        "text.output_norm.weight": (text_hidden,),
+        "text.output.weight": (text_vocab, text_hidden),
+        "audio.conv.0.weight": (audio_downsample, 1, 3, 3),
+        "audio.conv.0.bias": (audio_downsample,),
+        "audio.conv.1.weight": (audio_downsample, audio_downsample, 3, 3),
+        "audio.conv.1.bias": (audio_downsample,),
+        "audio.conv.2.weight": (audio_downsample, audio_downsample, 3, 3),
+        "audio.conv.2.bias": (audio_downsample,),
+        "audio.conv_out.weight": (audio_hidden, audio_conv_out),
+        "audio.post_norm.weight": (audio_hidden,),
+        "audio.post_norm.bias": (audio_hidden,),
+        "audio.proj.0.weight": (audio_hidden, audio_hidden),
+        "audio.proj.0.bias": (audio_hidden,),
+        "audio.proj.1.weight": (audio_output, audio_hidden),
+        "audio.proj.1.bias": (audio_output,),
+    }
+
+    for layer in range(text["num_hidden_layers"]):
+        prefix = f"text.blk.{layer}."
+        shapes[prefix + "attn_norm.weight"] = (text_hidden,)
+        shapes[prefix + "ffn_norm.weight"] = (text_hidden,)
+        shapes[prefix + "attn_q.weight"] = (text_q_dim, text_hidden)
+        shapes[prefix + "attn_k.weight"] = (text_kv_dim, text_hidden)
+        shapes[prefix + "attn_v.weight"] = (text_kv_dim, text_hidden)
+        shapes[prefix + "attn_output.weight"] = (text_hidden, text_q_dim)
+        shapes[prefix + "attn_q_norm.weight"] = (text["head_dim"],)
+        shapes[prefix + "attn_k_norm.weight"] = (text["head_dim"],)
+        shapes[prefix + "ffn_gate.weight"] = (text_intermediate, text_hidden)
+        shapes[prefix + "ffn_up.weight"] = (text_intermediate, text_hidden)
+        shapes[prefix + "ffn_down.weight"] = (text_hidden, text_intermediate)
+
+    for layer in range(audio["encoder_layers"]):
+        prefix = f"audio.blk.{layer}."
+        shapes[prefix + "attn_norm.weight"] = (audio_hidden,)
+        shapes[prefix + "attn_norm.bias"] = (audio_hidden,)
+        shapes[prefix + "ffn_norm.weight"] = (audio_hidden,)
+        shapes[prefix + "ffn_norm.bias"] = (audio_hidden,)
+        shapes[prefix + "attn_q.weight"] = (audio_hidden, audio_hidden)
+        shapes[prefix + "attn_q.bias"] = (audio_hidden,)
+        shapes[prefix + "attn_k.weight"] = (audio_hidden, audio_hidden)
+        shapes[prefix + "attn_k.bias"] = (audio_hidden,)
+        shapes[prefix + "attn_v.weight"] = (audio_hidden, audio_hidden)
+        shapes[prefix + "attn_v.bias"] = (audio_hidden,)
+        shapes[prefix + "attn_output.weight"] = (audio_hidden, audio_hidden)
+        shapes[prefix + "attn_output.bias"] = (audio_hidden,)
+        shapes[prefix + "ffn_up.weight"] = (audio_ffn, audio_hidden)
+        shapes[prefix + "ffn_up.bias"] = (audio_ffn,)
+        shapes[prefix + "ffn_down.weight"] = (audio_hidden, audio_ffn)
+        shapes[prefix + "ffn_down.bias"] = (audio_hidden,)
+
+    return shapes
+
+
+def _tensor_shape(handle, name: str) -> tuple[int, ...]:
+    try:
+        return tuple(handle.get_slice(name).get_shape())
+    except AttributeError:
+        return tuple(handle.get_tensor(name).shape)
+
+
+def collect_tensor_map(
+    files: Iterable[Path],
+    expected_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> dict[str, str]:
+    if safe_open is None:
+        raise RuntimeError("reading safetensors requires the `safetensors` Python package")
+
     tensor_map: dict[str, str] = {}
+    seen_native: set[str] = set()
     for file in files:
         with safe_open(file, framework="pt", device="cpu") as handle:
             for name in handle.keys():
                 mapped = rename_tensor(name)
                 if mapped in tensor_map.values():
                     raise ValueError(f"duplicate mapped tensor name: {mapped}")
+                if expected_shapes is not None:
+                    expected = expected_shapes.get(mapped)
+                    if expected is None:
+                        raise ValueError(f"unexpected mapped tensor name: {mapped}")
+                    actual = _tensor_shape(handle, name)
+                    if actual != expected:
+                        raise ValueError(
+                            f"shape mismatch for {name} -> {mapped}: expected {expected}, got {actual}"
+                        )
+                    seen_native.add(mapped)
                 tensor_map[name] = mapped
+    if expected_shapes is not None:
+        missing = sorted(set(expected_shapes) - seen_native)
+        if missing:
+            preview = ", ".join(missing[:8])
+            suffix = "" if len(missing) <= 8 else f", ... ({len(missing)} total)"
+            raise ValueError(f"missing expected tensors: {preview}{suffix}")
     return tensor_map
 
 
@@ -214,7 +326,8 @@ def main() -> int:
 
     cfg = _load_config(args.checkpoint)
     files = _iter_safetensors(args.checkpoint)
-    tensor_map = collect_tensor_map(files)
+    shape_specs = expected_hf_shapes(cfg)
+    tensor_map = collect_tensor_map(files, expected_shapes=shape_specs)
 
     if args.dump_map:
         args.dump_map.write_text(json.dumps(tensor_map, indent=2, sort_keys=True) + "\n")
@@ -225,6 +338,7 @@ def main() -> int:
     print(f"checkpoint={args.checkpoint}")
     print(f"safetensors={len(files)}")
     print(f"tensors={len(tensor_map)}")
+    print(f"shape_checks={len(shape_specs)}")
     print(f"text_layers={text_layers}")
     print(f"audio_layers={audio_layers}")
 

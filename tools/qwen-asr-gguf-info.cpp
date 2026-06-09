@@ -2,8 +2,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <string>
+#include <vector>
 
 static void usage(const char * argv0) {
     std::cerr
@@ -46,6 +48,19 @@ static void print_config(const QwenAsrNativeConfig & cfg) {
     }
 }
 
+static bool has_spec(
+    const std::vector<QwenAsrTensorSpec> & specs,
+    const std::string & name,
+    std::initializer_list<int64_t> ne) {
+    for (const QwenAsrTensorSpec & spec : specs) {
+        if (spec.name != name) {
+            continue;
+        }
+        return spec.ne == std::vector<int64_t>(ne);
+    }
+    return false;
+}
+
 static int self_test() {
     const char * path = "/tmp/qwenasr-gguf-info-fixture.gguf";
     std::string error;
@@ -60,6 +75,22 @@ static int self_test() {
         std::cerr << error << "\n";
         return 1;
     }
+
+    const std::vector<QwenAsrTensorSpec> specs = qwenasr_expected_tensor_specs(cfg);
+    if (specs.size() != 612) {
+        std::remove(path);
+        std::cerr << "expected 612 tensor specs for 0.6B fixture, got " << specs.size() << "\n";
+        return 1;
+    }
+    if (!has_spec(specs, "text.blk.0.attn_q.weight", { 1024, 2048 }) ||
+        !has_spec(specs, "audio.conv.0.weight", { 3, 3, 1, 480 }) ||
+        !has_spec(specs, "audio.conv_out.weight", { 7680, 896 }) ||
+        !has_spec(specs, "audio.proj.1.weight", { 896, 1024 })) {
+        std::remove(path);
+        std::cerr << "0.6B fixture tensor spec check failed\n";
+        return 1;
+    }
+
     std::remove(path);
     print_config(cfg);
     std::cout << "status=self-test-ok\n";

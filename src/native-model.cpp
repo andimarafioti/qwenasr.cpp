@@ -1,11 +1,14 @@
 #include "native-model.h"
 
+#include "ggml.h"
 #include "gguf.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
+#include <initializer_list>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 static bool require_key(const gguf_context * ctx, const char * key, int64_t * id, std::string * error) {
@@ -47,14 +50,80 @@ static bool get_str(const gguf_context * ctx, const char * key, std::string * ou
     return true;
 }
 
-static bool require_tensor(const gguf_context * ctx, const char * name, std::string * error) {
-    if (gguf_find_tensor(ctx, name) >= 0) {
-        return true;
+static std::string shape_string(const int64_t * ne, int n_dims) {
+    std::ostringstream ss;
+    ss << "[";
+    for (int i = 0; i < n_dims; ++i) {
+        if (i > 0) {
+            ss << ", ";
+        }
+        ss << ne[i];
     }
-    if (error) {
-        *error = std::string("missing GGUF tensor: ") + name;
+    ss << "]";
+    return ss.str();
+}
+
+static std::string shape_string(const std::vector<int64_t> & ne) {
+    return shape_string(ne.data(), static_cast<int>(ne.size()));
+}
+
+static bool require_tensor(
+    const gguf_context * ctx,
+    ggml_context * meta,
+    const QwenAsrTensorSpec & spec,
+    std::string * error) {
+    if (gguf_find_tensor(ctx, spec.name.c_str()) < 0) {
+        if (error) {
+            *error = std::string("missing GGUF tensor: ") + spec.name;
+        }
+        return false;
     }
-    return false;
+
+    ggml_tensor * tensor = meta ? ggml_get_tensor(meta, spec.name.c_str()) : nullptr;
+    if (!tensor) {
+        if (error) {
+            *error = std::string("missing GGML tensor metadata: ") + spec.name;
+        }
+        return false;
+    }
+
+    const int n_dims = ggml_n_dims(tensor);
+    if (n_dims != static_cast<int>(spec.ne.size())) {
+        if (error) {
+            *error = "GGUF tensor rank mismatch for " + spec.name +
+                ": expected " + shape_string(spec.ne) +
+                " got " + shape_string(tensor->ne, n_dims);
+        }
+        return false;
+    }
+
+    for (int i = 0; i < n_dims; ++i) {
+        if (tensor->ne[i] != spec.ne[static_cast<size_t>(i)]) {
+            if (error) {
+                *error = "GGUF tensor shape mismatch for " + spec.name +
+                    ": expected " + shape_string(spec.ne) +
+                    " got " + shape_string(tensor->ne, n_dims);
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void add_spec(
+    std::vector<QwenAsrTensorSpec> & specs,
+    std::string name,
+    std::initializer_list<int64_t> ne) {
+    specs.push_back({ std::move(name), std::vector<int64_t>(ne) });
+}
+
+static int64_t audio_conv_freq_bins(uint32_t mel_bins) {
+    int64_t bins = mel_bins;
+    bins = (bins + 1) / 2;
+    bins = (bins + 1) / 2;
+    bins = (bins + 1) / 2;
+    return bins;
 }
 
 bool qwenasr_load_gguf_metadata(
@@ -69,9 +138,10 @@ bool qwenasr_load_gguf_metadata(
         return false;
     }
 
+    ggml_context * meta = nullptr;
     gguf_init_params params {};
     params.no_alloc = true;
-    params.ctx = nullptr;
+    params.ctx = &meta;
     gguf_context * ctx = gguf_init_from_file(path, params);
     if (!ctx) {
         if (error) {
@@ -118,9 +188,9 @@ bool qwenasr_load_gguf_metadata(
     }
 
     if (ok && require_tensors) {
-        const std::vector<std::string> expected = qwenasr_expected_tensor_names(cfg);
-        for (const std::string & name : expected) {
-            ok = require_tensor(ctx, name.c_str(), error);
+        const std::vector<QwenAsrTensorSpec> expected = qwenasr_expected_tensor_specs(cfg);
+        for (const QwenAsrTensorSpec & spec : expected) {
+            ok = require_tensor(ctx, meta, spec, error);
             if (!ok) {
                 break;
             }
@@ -136,78 +206,94 @@ bool qwenasr_load_gguf_metadata(
         *out = cfg;
     }
 
+    if (meta) {
+        ggml_free(meta);
+    }
     gguf_free(ctx);
     return ok;
 }
 
-std::vector<std::string> qwenasr_expected_tensor_names(const QwenAsrNativeConfig & cfg) {
-    std::vector<std::string> names;
-    names.reserve(
+std::vector<QwenAsrTensorSpec> qwenasr_expected_tensor_specs(const QwenAsrNativeConfig & cfg) {
+    std::vector<QwenAsrTensorSpec> specs;
+    specs.reserve(
         3 + 13 +
         static_cast<size_t>(cfg.text_num_hidden_layers) * 11 +
         static_cast<size_t>(cfg.audio_encoder_layers) * 16);
 
-    names.push_back("text.token_embd.weight");
-    names.push_back("text.output_norm.weight");
-    names.push_back("text.output.weight");
+    const int64_t text_hidden = cfg.text_hidden_size;
+    const int64_t text_q_dim = static_cast<int64_t>(cfg.text_num_attention_heads) * cfg.text_head_dim;
+    const int64_t text_kv_dim = static_cast<int64_t>(cfg.text_num_key_value_heads) * cfg.text_head_dim;
+    const int64_t text_intermediate = cfg.text_intermediate_size;
+    const int64_t text_vocab = cfg.text_vocab_size;
+    const int64_t audio_hidden = cfg.audio_d_model;
+    const int64_t audio_downsample = cfg.audio_downsample_hidden_size;
+    const int64_t audio_ffn = cfg.audio_encoder_ffn_dim;
+    const int64_t audio_output = cfg.audio_output_dim;
+    const int64_t audio_conv_out = audio_downsample * audio_conv_freq_bins(cfg.audio_num_mel_bins);
 
-    names.push_back("audio.conv.0.weight");
-    names.push_back("audio.conv.0.bias");
-    names.push_back("audio.conv.1.weight");
-    names.push_back("audio.conv.1.bias");
-    names.push_back("audio.conv.2.weight");
-    names.push_back("audio.conv.2.bias");
-    names.push_back("audio.conv_out.weight");
-    names.push_back("audio.post_norm.weight");
-    names.push_back("audio.post_norm.bias");
-    names.push_back("audio.proj.0.weight");
-    names.push_back("audio.proj.0.bias");
-    names.push_back("audio.proj.1.weight");
-    names.push_back("audio.proj.1.bias");
+    add_spec(specs, "text.token_embd.weight", { text_hidden, text_vocab });
+    add_spec(specs, "text.output_norm.weight", { text_hidden });
+    add_spec(specs, "text.output.weight", { text_hidden, text_vocab });
 
-    static const char * text_suffixes[] = {
-        "attn_norm.weight",
-        "ffn_norm.weight",
-        "attn_q.weight",
-        "attn_k.weight",
-        "attn_v.weight",
-        "attn_output.weight",
-        "attn_q_norm.weight",
-        "attn_k_norm.weight",
-        "ffn_gate.weight",
-        "ffn_up.weight",
-        "ffn_down.weight",
-    };
+    add_spec(specs, "audio.conv.0.weight", { 3, 3, 1, audio_downsample });
+    add_spec(specs, "audio.conv.0.bias", { audio_downsample });
+    add_spec(specs, "audio.conv.1.weight", { 3, 3, audio_downsample, audio_downsample });
+    add_spec(specs, "audio.conv.1.bias", { audio_downsample });
+    add_spec(specs, "audio.conv.2.weight", { 3, 3, audio_downsample, audio_downsample });
+    add_spec(specs, "audio.conv.2.bias", { audio_downsample });
+    add_spec(specs, "audio.conv_out.weight", { audio_conv_out, audio_hidden });
+    add_spec(specs, "audio.post_norm.weight", { audio_hidden });
+    add_spec(specs, "audio.post_norm.bias", { audio_hidden });
+    add_spec(specs, "audio.proj.0.weight", { audio_hidden, audio_hidden });
+    add_spec(specs, "audio.proj.0.bias", { audio_hidden });
+    add_spec(specs, "audio.proj.1.weight", { audio_hidden, audio_output });
+    add_spec(specs, "audio.proj.1.bias", { audio_output });
+
     for (uint32_t layer = 0; layer < cfg.text_num_hidden_layers; ++layer) {
-        for (const char * suffix : text_suffixes) {
-            names.push_back("text.blk." + std::to_string(layer) + "." + suffix);
-        }
+        const std::string prefix = "text.blk." + std::to_string(layer) + ".";
+        add_spec(specs, prefix + "attn_norm.weight", { text_hidden });
+        add_spec(specs, prefix + "ffn_norm.weight", { text_hidden });
+        add_spec(specs, prefix + "attn_q.weight", { text_hidden, text_q_dim });
+        add_spec(specs, prefix + "attn_k.weight", { text_hidden, text_kv_dim });
+        add_spec(specs, prefix + "attn_v.weight", { text_hidden, text_kv_dim });
+        add_spec(specs, prefix + "attn_output.weight", { text_q_dim, text_hidden });
+        add_spec(specs, prefix + "attn_q_norm.weight", { cfg.text_head_dim });
+        add_spec(specs, prefix + "attn_k_norm.weight", { cfg.text_head_dim });
+        add_spec(specs, prefix + "ffn_gate.weight", { text_hidden, text_intermediate });
+        add_spec(specs, prefix + "ffn_up.weight", { text_hidden, text_intermediate });
+        add_spec(specs, prefix + "ffn_down.weight", { text_intermediate, text_hidden });
     }
 
-    static const char * audio_suffixes[] = {
-        "attn_norm.weight",
-        "attn_norm.bias",
-        "ffn_norm.weight",
-        "ffn_norm.bias",
-        "attn_q.weight",
-        "attn_q.bias",
-        "attn_k.weight",
-        "attn_k.bias",
-        "attn_v.weight",
-        "attn_v.bias",
-        "attn_output.weight",
-        "attn_output.bias",
-        "ffn_up.weight",
-        "ffn_up.bias",
-        "ffn_down.weight",
-        "ffn_down.bias",
-    };
     for (uint32_t layer = 0; layer < cfg.audio_encoder_layers; ++layer) {
-        for (const char * suffix : audio_suffixes) {
-            names.push_back("audio.blk." + std::to_string(layer) + "." + suffix);
-        }
+        const std::string prefix = "audio.blk." + std::to_string(layer) + ".";
+        add_spec(specs, prefix + "attn_norm.weight", { audio_hidden });
+        add_spec(specs, prefix + "attn_norm.bias", { audio_hidden });
+        add_spec(specs, prefix + "ffn_norm.weight", { audio_hidden });
+        add_spec(specs, prefix + "ffn_norm.bias", { audio_hidden });
+        add_spec(specs, prefix + "attn_q.weight", { audio_hidden, audio_hidden });
+        add_spec(specs, prefix + "attn_q.bias", { audio_hidden });
+        add_spec(specs, prefix + "attn_k.weight", { audio_hidden, audio_hidden });
+        add_spec(specs, prefix + "attn_k.bias", { audio_hidden });
+        add_spec(specs, prefix + "attn_v.weight", { audio_hidden, audio_hidden });
+        add_spec(specs, prefix + "attn_v.bias", { audio_hidden });
+        add_spec(specs, prefix + "attn_output.weight", { audio_hidden, audio_hidden });
+        add_spec(specs, prefix + "attn_output.bias", { audio_hidden });
+        add_spec(specs, prefix + "ffn_up.weight", { audio_hidden, audio_ffn });
+        add_spec(specs, prefix + "ffn_up.bias", { audio_ffn });
+        add_spec(specs, prefix + "ffn_down.weight", { audio_ffn, audio_hidden });
+        add_spec(specs, prefix + "ffn_down.bias", { audio_hidden });
     }
 
+    return specs;
+}
+
+std::vector<std::string> qwenasr_expected_tensor_names(const QwenAsrNativeConfig & cfg) {
+    std::vector<QwenAsrTensorSpec> specs = qwenasr_expected_tensor_specs(cfg);
+    std::vector<std::string> names;
+    names.reserve(specs.size());
+    for (const QwenAsrTensorSpec & spec : specs) {
+        names.push_back(spec.name);
+    }
     return names;
 }
 

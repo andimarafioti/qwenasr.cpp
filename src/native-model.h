@@ -40,6 +40,11 @@ struct QwenAsrNativeConfig {
     std::vector<std::string> first_tensors;
 };
 
+struct QwenAsrTensorSpec {
+    std::string name;
+    std::vector<int64_t> ne; // GGML order, ne[0] is the innermost dimension.
+};
+
 bool qwenasr_load_gguf_metadata(
     const char * path,
     bool require_tensors,
@@ -47,5 +52,7 @@ bool qwenasr_load_gguf_metadata(
     std::string * error);
 
 bool qwenasr_write_metadata_fixture(const char * path, std::string * error);
+
+std::vector<QwenAsrTensorSpec> qwenasr_expected_tensor_specs(const QwenAsrNativeConfig & cfg);
 
 std::vector<std::string> qwenasr_expected_tensor_names(const QwenAsrNativeConfig & cfg);
