@@ -28,6 +28,8 @@ struct QwenAsrTextGenerateOutput {
     std::vector<int32_t> generated_ids;
 };
 
+struct QwenAsrTextLayerBackend;
+
 bool qwenasr_text_layer_forward_cpu(
     const QwenAsrGgufModel & model,
     const QwenAsrDecoderInputOutput & input,
@@ -38,6 +40,42 @@ bool qwenasr_text_layer_forward_cpu(
     int intermediate,
     float rope_theta,
     float rms_norm_eps,
+    QwenAsrTextLayerOutput * out,
+    std::string * error);
+
+bool qwenasr_text_layer_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int layer,
+    int n_threads,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextLayerOutput * out,
+    std::string * error);
+
+bool qwenasr_text_layer_backend_init(
+    const QwenAsrGgufModel & model,
+    int layer,
+    int n_threads,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextLayerBackend ** out,
+    std::string * error);
+
+void qwenasr_text_layer_backend_free(QwenAsrTextLayerBackend * backend);
+
+bool qwenasr_text_layer_backend_forward(
+    QwenAsrTextLayerBackend * backend,
+    const QwenAsrDecoderInputOutput & input,
     QwenAsrTextLayerOutput * out,
     std::string * error);
 

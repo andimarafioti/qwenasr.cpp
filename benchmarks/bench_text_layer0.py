@@ -28,12 +28,14 @@ def _bench_cpp(
     threads: int,
     layer: int,
     repeat: int,
+    text_backend: str,
     audio_backend: str,
     system: str,
     language: str,
-) -> tuple[list[float], list[float]]:
+) -> tuple[list[float], list[float], list[float]]:
     text_times = []
     decoder_times = []
+    text_init_times = []
     for _ in range(repeat):
         cmd = [
             str(text_bin),
@@ -43,6 +45,8 @@ def _bench_cpp(
             str(threads),
             "--layer",
             str(layer),
+            "--backend",
+            text_backend,
             "--audio-backend",
             audio_backend,
         ]
@@ -53,7 +57,8 @@ def _bench_cpp(
         meta = _parse_kv(_run(cmd))
         text_times.append(float(meta["text_layer_ms"]))
         decoder_times.append(float(meta["decoder_input_ms"]))
-    return text_times, decoder_times
+        text_init_times.append(float(meta.get("text_init_ms", 0.0)))
+    return text_times, decoder_times, text_init_times
 
 
 def _bench_torch(
@@ -138,6 +143,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
+    parser.add_argument("--cpp-backends", nargs="+", choices=("scalar", "ggml", "sched"), default=["scalar"])
     parser.add_argument("--cpp-audio-backends", nargs="+", choices=("ggml", "sched"), default=["sched"])
     parser.add_argument("--torch-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
@@ -176,20 +182,21 @@ def main() -> int:
         for name, tensor in _text_layer_tensors(args.layer).items()
     }
 
-    cpp_results = {
-        backend: _bench_cpp(
-            text_bin,
-            args.gguf,
-            args.audio,
-            args.threads,
-            args.layer,
-            args.repeat,
-            backend,
-            args.system,
-            args.language,
-        )
-        for backend in args.cpp_audio_backends
-    }
+    cpp_results = {}
+    for text_backend in args.cpp_backends:
+        for audio_backend in args.cpp_audio_backends:
+            cpp_results[(text_backend, audio_backend)] = _bench_cpp(
+                text_bin,
+                args.gguf,
+                args.audio,
+                args.threads,
+                args.layer,
+                args.repeat,
+                text_backend,
+                audio_backend,
+                args.system,
+                args.language,
+            )
     torch_times = _bench_torch(
         x,
         weights,
@@ -214,13 +221,17 @@ def main() -> int:
     print(f"head_dim={head_dim}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    for backend, (text_times, decoder_times) in cpp_results.items():
+    for (text_backend, audio_backend), (text_times, decoder_times, text_init_times) in cpp_results.items():
         cpp_best, cpp_mean = _summarize(text_times)
         decoder_best, decoder_mean = _summarize(decoder_times)
-        print(f"cpp_{backend}_text_layer_best_ms={cpp_best:.3f}")
-        print(f"cpp_{backend}_text_layer_mean_ms={cpp_mean:.3f}")
-        print(f"cpp_{backend}_decoder_input_best_ms={decoder_best:.3f}")
-        print(f"cpp_{backend}_decoder_input_mean_ms={decoder_mean:.3f}")
+        text_init_best, text_init_mean = _summarize(text_init_times)
+        prefix = f"cpp_{text_backend}_{audio_backend}"
+        print(f"{prefix}_text_init_best_ms={text_init_best:.3f}")
+        print(f"{prefix}_text_init_mean_ms={text_init_mean:.3f}")
+        print(f"{prefix}_text_layer_best_ms={cpp_best:.3f}")
+        print(f"{prefix}_text_layer_mean_ms={cpp_mean:.3f}")
+        print(f"{prefix}_decoder_input_best_ms={decoder_best:.3f}")
+        print(f"{prefix}_decoder_input_mean_ms={decoder_mean:.3f}")
     print(f"torch_text_layer_best_ms={torch_best:.3f}")
     print(f"torch_text_layer_mean_ms={torch_mean:.3f}")
     print("status=ok")

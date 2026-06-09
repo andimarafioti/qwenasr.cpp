@@ -1,5 +1,17 @@
 #include "text-decoder.h"
 
+#include "ggml.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
+#endif
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -56,6 +68,35 @@ static const float * tensor_f32(const QwenAsrGgufTensorView & tensor) {
     return static_cast<const float *>(tensor.data);
 }
 
+static ggml_tensor * new_f32_tensor_from_view(
+    ggml_context * ctx,
+    const QwenAsrGgufTensorView & view) {
+    ggml_tensor * tensor = ggml_new_tensor(
+        ctx,
+        GGML_TYPE_F32,
+        static_cast<int>(view.ne.size()),
+        view.ne.data());
+    std::memcpy(tensor->data, view.data, ggml_nbytes(tensor));
+    return tensor;
+}
+
+static ggml_tensor * linear_ggml(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * weight) {
+    ggml_tensor * output = ggml_mul_mat(ctx, weight, input);
+    ggml_mul_mat_set_prec(output, GGML_PREC_F32);
+    return output;
+}
+
+static ggml_tensor * rms_norm_ggml(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * weight,
+    float eps) {
+    return ggml_mul(ctx, ggml_rms_norm(ctx, input, eps), weight);
+}
+
 struct TextLayerTensors {
     QwenAsrGgufTensorView attn_norm_w;
     QwenAsrGgufTensorView ffn_norm_w;
@@ -82,6 +123,43 @@ struct TextDecoderTensorContext {
     QwenAsrGgufTensorView embd_w;
     QwenAsrGgufTensorView output_norm_w;
     QwenAsrGgufTensorView output_w;
+};
+
+struct BackendPendingCopy {
+    ggml_tensor * tensor = nullptr;
+    const void * data = nullptr;
+    size_t nbytes = 0;
+};
+
+struct BackendTextLayerTensors {
+    ggml_tensor * attn_norm_w = nullptr;
+    ggml_tensor * ffn_norm_w = nullptr;
+    ggml_tensor * q_w = nullptr;
+    ggml_tensor * k_w = nullptr;
+    ggml_tensor * v_w = nullptr;
+    ggml_tensor * out_w = nullptr;
+    ggml_tensor * q_norm_w = nullptr;
+    ggml_tensor * k_norm_w = nullptr;
+    ggml_tensor * gate_w = nullptr;
+    ggml_tensor * up_w = nullptr;
+    ggml_tensor * down_w = nullptr;
+};
+
+struct QwenAsrTextLayerBackend {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context * weight_ctx = nullptr;
+    ggml_backend_buffer_t weight_buffer = nullptr;
+    BackendTextLayerTensors tensors;
+    int n_threads = 1;
+    int layer = 0;
+    int hidden = 0;
+    int n_heads = 0;
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    int intermediate = 0;
+    float rope_theta = 0.0f;
+    float rms_norm_eps = 0.0f;
 };
 
 static bool load_text_layer_tensors(
@@ -121,6 +199,123 @@ static bool load_text_layer_tensors(
         require_shape(tensors->gate_w, hidden, intermediate, error) &&
         require_shape(tensors->up_w, hidden, intermediate, error) &&
         require_shape(tensors->down_w, intermediate, hidden, error);
+}
+
+static ggml_tensor * new_backend_weight_from_view(
+    ggml_context * ctx,
+    const QwenAsrGgufTensorView & view,
+    std::vector<BackendPendingCopy> * pending) {
+    ggml_tensor * tensor = ggml_new_tensor(
+        ctx,
+        GGML_TYPE_F32,
+        static_cast<int>(view.ne.size()),
+        view.ne.data());
+    ggml_set_name(tensor, view.name.c_str());
+    if (pending) {
+        pending->push_back({ tensor, view.data, ggml_nbytes(tensor) });
+    }
+    return tensor;
+}
+
+static BackendTextLayerTensors backend_text_layer_tensors_from_views(
+    ggml_context * ctx,
+    const TextLayerTensors & views,
+    std::vector<BackendPendingCopy> * pending) {
+    BackendTextLayerTensors tensors;
+    tensors.attn_norm_w = new_backend_weight_from_view(ctx, views.attn_norm_w, pending);
+    tensors.ffn_norm_w = new_backend_weight_from_view(ctx, views.ffn_norm_w, pending);
+    tensors.q_w = new_backend_weight_from_view(ctx, views.q_w, pending);
+    tensors.k_w = new_backend_weight_from_view(ctx, views.k_w, pending);
+    tensors.v_w = new_backend_weight_from_view(ctx, views.v_w, pending);
+    tensors.out_w = new_backend_weight_from_view(ctx, views.out_w, pending);
+    tensors.q_norm_w = new_backend_weight_from_view(ctx, views.q_norm_w, pending);
+    tensors.k_norm_w = new_backend_weight_from_view(ctx, views.k_norm_w, pending);
+    tensors.gate_w = new_backend_weight_from_view(ctx, views.gate_w, pending);
+    tensors.up_w = new_backend_weight_from_view(ctx, views.up_w, pending);
+    tensors.down_w = new_backend_weight_from_view(ctx, views.down_w, pending);
+    return tensors;
+}
+
+static ggml_tensor * backend_text_layer_forward_ggml(
+    ggml_context * ctx,
+    const BackendTextLayerTensors & tensors,
+    ggml_tensor * x,
+    ggml_tensor * positions,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps) {
+    const int tokens = static_cast<int>(x->ne[1]);
+    const int q_dim = n_heads * head_dim;
+    GGML_UNUSED(hidden);
+    GGML_UNUSED(intermediate);
+
+    ggml_tensor * normed = rms_norm_ggml(ctx, x, tensors.attn_norm_w, rms_norm_eps);
+    ggml_tensor * q = linear_ggml(ctx, normed, tensors.q_w);
+    ggml_tensor * k = linear_ggml(ctx, normed, tensors.k_w);
+    ggml_tensor * v = linear_ggml(ctx, normed, tensors.v_w);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, tokens);
+    k = ggml_reshape_3d(ctx, k, head_dim, n_kv_heads, tokens);
+    v = ggml_reshape_3d(ctx, v, head_dim, n_kv_heads, tokens);
+
+    q = rms_norm_ggml(ctx, q, tensors.q_norm_w, rms_norm_eps);
+    k = rms_norm_ggml(ctx, k, tensors.k_norm_w, rms_norm_eps);
+    q = ggml_rope_ext(
+        ctx,
+        q,
+        positions,
+        nullptr,
+        head_dim,
+        GGML_ROPE_TYPE_NEOX,
+        0,
+        rope_theta,
+        1.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f);
+    k = ggml_rope_ext(
+        ctx,
+        k,
+        positions,
+        nullptr,
+        head_dim,
+        GGML_ROPE_TYPE_NEOX,
+        0,
+        rope_theta,
+        1.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f);
+
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_diag_mask_inf(ctx, scores, 0);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
+
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, q_dim, tokens);
+
+    ggml_tensor * projected = linear_ggml(ctx, attn, tensors.out_w);
+    ggml_tensor * hidden_states = ggml_add(ctx, x, projected);
+
+    ggml_tensor * ffn_normed = rms_norm_ggml(ctx, hidden_states, tensors.ffn_norm_w, rms_norm_eps);
+    ggml_tensor * gate = linear_ggml(ctx, ffn_normed, tensors.gate_w);
+    ggml_tensor * up = linear_ggml(ctx, ffn_normed, tensors.up_w);
+    ggml_tensor * activated = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor * down = linear_ggml(ctx, activated, tensors.down_w);
+    return ggml_add(ctx, hidden_states, down);
 }
 
 static bool load_text_decoder_tensor_context(
@@ -439,6 +634,105 @@ static bool text_layer_forward_values_cpu(
     return true;
 }
 
+static bool text_layer_forward_values_ggml(
+    const QwenAsrGgufModel & model,
+    const std::vector<float> & input_values,
+    int tokens,
+    int hidden,
+    int layer,
+    int n_threads,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    std::vector<float> * out_values,
+    std::string * error) {
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+    if (!out_values) {
+        set_error(error, "text_layer_forward_values_ggml: out_values is null");
+        return false;
+    }
+    const int q_dim = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    if (tokens <= 0 || hidden <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || intermediate <= 0 || n_heads % n_kv_heads != 0 ||
+        q_dim <= 0 || kv_dim <= 0 || input_values.size() != static_cast<size_t>(tokens) * hidden) {
+        set_error(error, "invalid GGML text layer configuration");
+        return false;
+    }
+
+    TextLayerTensors tensors;
+    if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &tensors, error)) {
+        return false;
+    }
+
+    const size_t ctx_size = 1024ull * 1024ull * 1024ull;
+    std::vector<uint8_t> ctx_buffer(ctx_size);
+    ggml_init_params params;
+    params.mem_size = ctx_buffer.size();
+    params.mem_buffer = ctx_buffer.data();
+    params.no_alloc = false;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize GGML context for text layer");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+    std::memcpy(x->data, input_values.data(), input_values.size() * sizeof(float));
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+    int32_t * position_data = static_cast<int32_t *>(positions->data);
+    for (int token = 0; token < tokens; ++token) {
+        position_data[token] = token;
+    }
+
+    BackendTextLayerTensors graph_tensors;
+    graph_tensors.attn_norm_w = new_f32_tensor_from_view(ctx, tensors.attn_norm_w);
+    graph_tensors.ffn_norm_w = new_f32_tensor_from_view(ctx, tensors.ffn_norm_w);
+    graph_tensors.q_w = new_f32_tensor_from_view(ctx, tensors.q_w);
+    graph_tensors.k_w = new_f32_tensor_from_view(ctx, tensors.k_w);
+    graph_tensors.v_w = new_f32_tensor_from_view(ctx, tensors.v_w);
+    graph_tensors.out_w = new_f32_tensor_from_view(ctx, tensors.out_w);
+    graph_tensors.q_norm_w = new_f32_tensor_from_view(ctx, tensors.q_norm_w);
+    graph_tensors.k_norm_w = new_f32_tensor_from_view(ctx, tensors.k_norm_w);
+    graph_tensors.gate_w = new_f32_tensor_from_view(ctx, tensors.gate_w);
+    graph_tensors.up_w = new_f32_tensor_from_view(ctx, tensors.up_w);
+    graph_tensors.down_w = new_f32_tensor_from_view(ctx, tensors.down_w);
+
+    ggml_tensor * hidden_states = backend_text_layer_forward_ggml(
+        ctx,
+        graph_tensors,
+        x,
+        positions,
+        hidden,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        intermediate,
+        rope_theta,
+        rms_norm_eps);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, hidden_states);
+    const ggml_status status = ggml_graph_compute_with_ctx(ctx, graph, n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        set_error(error, "GGML text layer graph compute failed");
+        return false;
+    }
+
+    out_values->assign(static_cast<size_t>(tokens) * hidden, 0.0f);
+    std::memcpy(out_values->data(), ggml_get_data_f32(hidden_states), out_values->size() * sizeof(float));
+
+    ggml_free(ctx);
+    return true;
+}
+
 static bool compute_logits_for_state_cpu(
     const QwenAsrGgufModel & model,
     const float * state,
@@ -667,6 +961,254 @@ bool qwenasr_text_layer_forward_cpu(
             error)) {
         return false;
     }
+    *out = std::move(result);
+    return true;
+}
+
+bool qwenasr_text_layer_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int layer,
+    int n_threads,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextLayerOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_layer_forward_ggml: out is null");
+        return false;
+    }
+
+    QwenAsrTextLayerOutput result;
+    result.tokens = input.tokens;
+    result.hidden = input.hidden;
+    if (!text_layer_forward_values_ggml(
+            model,
+            input.values,
+            input.tokens,
+            input.hidden,
+            layer,
+            n_threads,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate,
+            rope_theta,
+            rms_norm_eps,
+            &result.values,
+            error)) {
+        return false;
+    }
+    *out = std::move(result);
+    return true;
+}
+
+void qwenasr_text_layer_backend_free(QwenAsrTextLayerBackend * backend) {
+    if (!backend) {
+        return;
+    }
+    if (backend->sched) {
+        ggml_backend_sched_free(backend->sched);
+        backend->sched = nullptr;
+    }
+    if (backend->weight_buffer) {
+        ggml_backend_buffer_free(backend->weight_buffer);
+        backend->weight_buffer = nullptr;
+    }
+    if (backend->weight_ctx) {
+        ggml_free(backend->weight_ctx);
+        backend->weight_ctx = nullptr;
+    }
+    if (backend->backend) {
+        ggml_backend_free(backend->backend);
+        backend->backend = nullptr;
+    }
+    delete backend;
+}
+
+bool qwenasr_text_layer_backend_init(
+    const QwenAsrGgufModel & model,
+    int layer,
+    int n_threads,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextLayerBackend ** out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_layer_backend_init: out is null");
+        return false;
+    }
+    *out = nullptr;
+    const int q_dim = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    if (layer < 0 || hidden <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        intermediate <= 0 || n_heads % n_kv_heads != 0 || q_dim <= 0 || kv_dim <= 0) {
+        set_error(error, "invalid text layer backend configuration");
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+
+    QwenAsrTextLayerBackend * runtime = new QwenAsrTextLayerBackend();
+    runtime->n_threads = n_threads;
+    runtime->layer = layer;
+    runtime->hidden = hidden;
+    runtime->n_heads = n_heads;
+    runtime->n_kv_heads = n_kv_heads;
+    runtime->head_dim = head_dim;
+    runtime->intermediate = intermediate;
+    runtime->rope_theta = rope_theta;
+    runtime->rms_norm_eps = rms_norm_eps;
+
+    runtime->backend = ggml_backend_cpu_init();
+    if (!runtime->backend) {
+        qwenasr_text_layer_backend_free(runtime);
+        set_error(error, "failed to initialize GGML CPU backend for text layer");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
+
+    constexpr size_t max_nodes = 4096;
+    ggml_backend_t backends[] = { runtime->backend };
+    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    if (!runtime->sched) {
+        qwenasr_text_layer_backend_free(runtime);
+        set_error(error, "failed to initialize GGML text layer backend scheduler");
+        return false;
+    }
+
+    constexpr int n_weight_tensors = 11;
+    const size_t weight_ctx_size = static_cast<size_t>(n_weight_tensors) * ggml_tensor_overhead() + 1024ull * 1024ull;
+    ggml_init_params params;
+    params.mem_size = weight_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    runtime->weight_ctx = ggml_init(params);
+    if (!runtime->weight_ctx) {
+        qwenasr_text_layer_backend_free(runtime);
+        set_error(error, "failed to initialize text layer weight context");
+        return false;
+    }
+
+    TextLayerTensors views;
+    if (!load_text_layer_tensors(model, layer, hidden, q_dim, kv_dim, head_dim, intermediate, &views, error)) {
+        qwenasr_text_layer_backend_free(runtime);
+        return false;
+    }
+
+    std::vector<BackendPendingCopy> pending;
+    pending.reserve(static_cast<size_t>(n_weight_tensors));
+    runtime->tensors = backend_text_layer_tensors_from_views(runtime->weight_ctx, views, &pending);
+
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    if (!runtime->weight_buffer) {
+        qwenasr_text_layer_backend_free(runtime);
+        set_error(error, "failed to allocate text layer backend weight buffer");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(runtime->weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    for (const BackendPendingCopy & copy : pending) {
+        ggml_backend_tensor_set(copy.tensor, copy.data, 0, copy.nbytes);
+    }
+
+    *out = runtime;
+    return true;
+}
+
+bool qwenasr_text_layer_backend_forward(
+    QwenAsrTextLayerBackend * backend,
+    const QwenAsrDecoderInputOutput & input,
+    QwenAsrTextLayerOutput * out,
+    std::string * error) {
+    if (!backend || !out) {
+        set_error(error, "qwenasr_text_layer_backend_forward: backend or out is null");
+        return false;
+    }
+    if (input.tokens <= 0 || input.hidden != backend->hidden ||
+        input.values.size() != static_cast<size_t>(input.tokens) * input.hidden) {
+        set_error(error, "invalid decoder input for text layer backend");
+        return false;
+    }
+
+    constexpr size_t max_nodes = 4096;
+    const size_t graph_ctx_size =
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    ggml_init_params params;
+    params.mem_size = graph_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize text layer graph context");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, backend->hidden, input.tokens);
+    ggml_set_name(x, "text_layer_input");
+    ggml_set_input(x);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, input.tokens);
+    ggml_set_name(positions, "text_layer_positions");
+    ggml_set_input(positions);
+
+    ggml_tensor * y = backend_text_layer_forward_ggml(
+        ctx,
+        backend->tensors,
+        x,
+        positions,
+        backend->hidden,
+        backend->n_heads,
+        backend->n_kv_heads,
+        backend->head_dim,
+        backend->intermediate,
+        backend->rope_theta,
+        backend->rms_norm_eps);
+    ggml_set_name(y, "text_layer_output");
+    ggml_set_output(y);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, y);
+    if (!ggml_backend_sched_alloc_graph(backend->sched, graph)) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text layer graph allocation failed");
+        return false;
+    }
+
+    std::vector<int32_t> positions_data(static_cast<size_t>(input.tokens), 0);
+    for (int token = 0; token < input.tokens; ++token) {
+        positions_data[static_cast<size_t>(token)] = token;
+    }
+
+    ggml_backend_tensor_set(x, input.values.data(), 0, input.values.size() * sizeof(float));
+    ggml_backend_tensor_set(positions, positions_data.data(), 0, positions_data.size() * sizeof(int32_t));
+    const ggml_status status = ggml_backend_sched_graph_compute(backend->sched, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text layer graph compute failed");
+        return false;
+    }
+
+    QwenAsrTextLayerOutput result;
+    result.tokens = input.tokens;
+    result.hidden = input.hidden;
+    result.values.assign(static_cast<size_t>(input.tokens) * input.hidden, 0.0f);
+    ggml_backend_tensor_get(y, result.values.data(), 0, result.values.size() * sizeof(float));
+
+    ggml_backend_sched_reset(backend->sched);
+    ggml_free(ctx);
     *out = std::move(result);
     return true;
 }

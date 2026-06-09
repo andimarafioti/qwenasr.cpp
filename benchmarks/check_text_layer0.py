@@ -21,6 +21,7 @@ def _dump_native_text_layer(
     audio: Path,
     n_threads: int,
     layer: int,
+    native_backend: str,
     audio_backend: str,
     system: str,
     language: str,
@@ -36,6 +37,8 @@ def _dump_native_text_layer(
             str(n_threads),
             "--layer",
             str(layer),
+            "--backend",
+            native_backend,
             "--audio-backend",
             audio_backend,
             "--out",
@@ -151,6 +154,7 @@ def main() -> int:
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument("--native-backend", choices=("scalar", "ggml", "sched"), default="scalar")
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
@@ -170,6 +174,7 @@ def main() -> int:
         args.audio,
         args.threads,
         args.layer,
+        args.native_backend,
         args.audio_backend,
         args.system,
         args.language,
@@ -209,6 +214,7 @@ def main() -> int:
     print(f"shape={native.shape}")
     print(f"native_backend={meta['backend']}")
     print(f"native_audio_backend={meta['audio_backend']}")
+    print(f"native_text_init_ms={float(meta.get('text_init_ms', 0.0)):.3f}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
     print(f"native_text_layer_ms={float(meta['text_layer_ms']):.3f}")
     print(f"max_abs={max_abs:.8f}")

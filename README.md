@@ -232,22 +232,29 @@ python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 
 The first Qwen3 text decoder block and full prompt prefill logits are available
 as `qwen-asr-text-layer`. It builds the decoder input embeddings, then runs
-scalar CPU Qwen3 blocks with RMSNorm, Q/K/V projection, per-head Q/K RMSNorm,
-RoPE, grouped-query causal attention, output projection, and SwiGLU MLP.
-`--prefill` runs every text block plus the output RMSNorm and LM head, returning
-the next-token logits from the final prompt position. `--generate N` adds a
-minimal greedy loop that decodes generated token ids back to text; `--kv-cache`
-keeps scalar per-layer K/V tensors from prompt prefill and runs following tokens
-through a one-row cached decode. This is a correctness boundary for the future
-native decoder backend path; it is not yet the fast GGML autoregressive decoder:
+Qwen3 blocks with RMSNorm, Q/K/V projection, per-head Q/K RMSNorm, RoPE,
+grouped-query causal attention, output projection, and SwiGLU MLP. Layer mode
+supports `--backend scalar`, a correctness-first per-call `--backend ggml`
+graph, and a qwentts.cpp-style `--backend sched` graph that uploads layer
+weights into a GGML CPU backend buffer once. `--prefill` runs every text block
+plus the output RMSNorm and LM head, returning the next-token logits from the
+final prompt position. `--generate N` adds a minimal greedy loop that decodes
+generated token ids back to text; `--kv-cache` keeps scalar per-layer K/V
+tensors from prompt prefill and runs following tokens through a one-row cached
+decode. Prefill and generation are still scalar text paths, so this is not yet
+the fast GGML autoregressive decoder:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --out text-layer0-sched.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend ggml --out text-layer0-ggml.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend sched --out text-layer0-backend.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --prefill --out next-token-logits.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --out native-prefix.txt
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --kv-cache --out native-prefix-cache.txt
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
+python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend ggml
+python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend sched
 python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-decode-backend kv-cache
@@ -285,7 +292,7 @@ python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr
 python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-layer0.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --torch-device cpu
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
-python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --torch-device cpu
+python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --cpp-backends scalar ggml sched --torch-device cpu
 python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-decode-backends kv-cache --torch-device cpu
 ```
@@ -369,13 +376,15 @@ and 7.23 ms for Torch CUDA BF16. A direct
 one-time backend initialization and 766 ms hot decoder-input time.
 
 For the first Qwen3 text decoder block, `benchmarks/check_text_layer0.py`
-matches the eager Torch reference at `4.67e-5` max absolute error on JFK with
-English forced output. `benchmarks/bench_text_layer0.py` measured roughly
-1.23-1.25 s for the scalar C++ text block with 8 CPU threads, 20.4 ms for Torch
-CPU FP32 with 8 threads, and 0.99 ms for Torch CUDA BF16. The C++ text block is
-therefore currently a validated decoder boundary, not a speed win; the next
-native decoder work is moving this layer into reusable GGML/backend graphs and
-adding KV-cache single-token decoding.
+matches the eager Torch reference at `4.67e-5` max absolute error for the scalar
+path and `4.69e-5` for the GGML graph on JFK with English forced output.
+`benchmarks/bench_text_layer0.py` measured roughly 1.24 s best for the scalar
+C++ text block, 310 ms best for the per-call GGML graph, 20.7 ms best for the
+scheduled GGML backend after a 14.0 ms one-time text weight upload, and 14.4 ms
+best for Torch CPU FP32 with 8 threads. The scheduled GGML layer is now close to
+Torch CPU for this prompt-sized block and much faster than the current scalar
+C++ layer; the next native decoder work is extending the reusable backend
+through prompt prefill and KV-cache single-token decoding.
 
 For the full prompt prefill logits, `benchmarks/check_text_prefill.py` matches
 the eager Torch reference at `1.34e-4` max absolute error on JFK and agrees on
