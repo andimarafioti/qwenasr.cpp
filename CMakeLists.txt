@@ -4,8 +4,21 @@ project(qwenasr-cpp-native LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 find_package(Python3 REQUIRED COMPONENTS Development.Embed)
+
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
+add_subdirectory(ggml)
+
+function(qwenasr_compile_options target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
+    endif()
+endfunction()
 
 add_library(qwenasr_bridge STATIC
     src/qwenasr.cpp
@@ -14,18 +27,22 @@ target_include_directories(qwenasr_bridge PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(qwenasr_bridge PUBLIC Python3::Python)
+qwenasr_compile_options(qwenasr_bridge)
 
-if(MSVC)
-    target_compile_options(qwenasr_bridge PRIVATE /W4)
-else()
-    target_compile_options(qwenasr_bridge PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
-endif()
+add_library(qwenasr_native STATIC
+    src/native-model.cpp
+)
+target_include_directories(qwenasr_native PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(qwenasr_native PUBLIC ggml)
+qwenasr_compile_options(qwenasr_native)
 
 add_executable(qwen-asr tools/qwen-asr.cpp)
 target_link_libraries(qwen-asr PRIVATE qwenasr_bridge)
+qwenasr_compile_options(qwen-asr)
 
-if(MSVC)
-    target_compile_options(qwen-asr PRIVATE /W4)
-else()
-    target_compile_options(qwen-asr PRIVATE -Wall -Wextra -Wshadow -Wconversion -Wno-unused-parameter)
-endif()
+add_executable(qwen-asr-gguf-info tools/qwen-asr-gguf-info.cpp)
+target_link_libraries(qwen-asr-gguf-info PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-gguf-info)

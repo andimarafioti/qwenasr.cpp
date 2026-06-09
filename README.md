@@ -87,6 +87,7 @@ harness for benchmarking and for replacing the internals with a native GGML
 runtime.
 
 ```bash
+git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
@@ -106,6 +107,13 @@ still under construction.
 ```bash
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
+```
+
+The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
+
+```bash
+./build/qwen-asr-gguf-info --self-test
+./build/qwen-asr-gguf-info qwen3-asr-0.6b-f32.gguf
 ```
 
 ## Streaming
