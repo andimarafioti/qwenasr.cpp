@@ -26,6 +26,7 @@ def _dump_native_prep(
     gguf: Path,
     audio: Path,
     n_threads: int,
+    backend: str,
 ) -> tuple[np.ndarray, dict[str, str]]:
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -38,6 +39,8 @@ def _dump_native_prep(
                     str(audio),
                     "--threads",
                     str(n_threads),
+                    "--backend",
+                    backend,
                     "--out",
                     str(tmp_path),
                 ]
@@ -77,6 +80,7 @@ def main() -> int:
     parser.add_argument("--cpp-bin", default=str(ROOT / "build" / "qwen-asr-audio-prep"))
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--native-backend", choices=("ggml", "sched"), default="ggml")
     parser.add_argument("--atol", type=float, default=5e-4)
     args = parser.parse_args()
 
@@ -88,7 +92,13 @@ def main() -> int:
         raise SystemExit(f"C++ feature binary not found: {features_bin}")
 
     features, feature_meta = _dump_native_features(features_bin, args.audio)
-    native, prep_meta = _dump_native_prep(prep_bin, args.gguf, args.audio, args.threads)
+    native, prep_meta = _dump_native_prep(
+        prep_bin,
+        args.gguf,
+        args.audio,
+        args.threads,
+        args.native_backend,
+    )
     ref_chunks = _build_chunks(features, feature_meta)
 
     try:

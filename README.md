@@ -180,11 +180,14 @@ python benchmarks/check_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-
 
 The pre-transformer audio prep boundary adds sinusoidal positional embeddings,
 packs only valid per-chunk frames, and reports the attention segments consumed
-by the audio transformer:
+by the audio transformer. `--backend sched` keeps the audio CNN weights in a
+persistent GGML CPU backend buffer:
 
 ```bash
 ./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --out audio-prep.f32
+./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --backend sched --out audio-prep-sched.f32
 python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
+python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --native-backend sched
 ```
 
 The first audio transformer block is available in `qwen-asr-audio-layer`. It
@@ -202,8 +205,8 @@ It runs the audio CNN, all audio transformer layers, `ln_post`, and the two
 projector layers, producing the 1024-wide audio embeddings consumed by the
 Qwen3 text decoder. The default `--backend ggml` path is the original
 correctness-first implementation. The `--backend sched` path keeps the audio
-transformer/projector weights in a persistent GGML CPU backend buffer and runs
-the full stack through one scheduler graph:
+CNN, transformer, and projector weights in persistent GGML CPU backend buffers
+and runs the hot path through scheduler graphs:
 
 ```bash
 ./build/qwen-asr-audio-encoder qwen3-asr-0.6b-audio-full.gguf sample.wav --out audio-encoder.f32
@@ -216,7 +219,7 @@ The decoder input assembly boundary is available as `qwen-asr-decoder-input`.
 It looks up prompt token embeddings, replaces `<|audio_pad|>` positions with
 the native audio encoder output, and emits the embeddings passed into the Qwen3
 text decoder. It also supports `--audio-backend sched` to reuse the scheduled
-audio transformer/projector backend:
+audio CNN, transformer, and projector backend:
 
 ```bash
 ./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --out decoder-input.f32
@@ -303,10 +306,12 @@ layout through the frontend projection and shows the current native CPU graph is
 not yet an end-to-end speed win.
 
 At the packed pre-transformer boundary, `benchmarks/bench_audio_prep.py`
-measured roughly 647 ms best for C++ GGML with 8 CPU threads, 102 ms for Torch
-CPU FP32, and 2.46 ms for Torch CUDA BF16. The output matches PyTorch at
-`1.53e-5` max absolute error and produces the JFK attention segments
-`[(0, 104), (104, 39)]`.
+measured roughly 774-874 ms for the original C++ GGML path with 8 CPU threads,
+435-462 ms with `--backend sched`, 99 ms for Torch CPU FP32, and 2.54 ms for
+Torch CUDA BF16. The output matches PyTorch at `1.53e-5` max absolute error and
+produces the JFK attention segments `[(0, 104), (104, 39)]`. A direct
+`qwen-asr-audio-prep --backend sched` run reported about 17 ms of one-time
+backend initialization and 450 ms hot prep time.
 
 For the first audio encoder block, `benchmarks/bench_audio_layer0.py` measured
 roughly 1.09-1.18 s best for the native GGML graph, 1.37 s for the scalar CPU
@@ -318,22 +323,22 @@ real GGML backends instead of rebuilding/copying every call.
 For the full audio encoder/projector boundary, `benchmarks/check_audio_encoder.py`
 matches the eager Torch reference at `4.09e-6` max absolute error on JFK. The
 original per-layer native GGML loop is correctness-first and slow; the
-qwentts.cpp-style scheduler path uploads transformer/projector weights once and
-removes the per-layer context rebuild/copy cost. On JFK with 8 CPU threads,
-`benchmarks/bench_audio_encoder.py` measured roughly 6.6-7.3 s for the original
-C++ GGML path, 0.71-1.14 s for `--backend sched`, 364 ms for Torch CPU FP32, and
-7.07 ms for Torch CUDA BF16. A direct `qwen-asr-audio-encoder --backend sched`
-run reported about 186 ms of one-time backend initialization and 812 ms hot
-encoder time.
+qwentts.cpp-style scheduler path uploads CNN/transformer/projector weights once
+and removes the frontend and per-layer context rebuild/copy costs. On JFK with
+8 CPU threads, `benchmarks/bench_audio_encoder.py` measured roughly 7.5-8.2 s
+for the original C++ GGML path, 0.61-0.62 s for `--backend sched`, 368 ms for
+Torch CPU FP32, and 6.88 ms for Torch CUDA BF16. A direct
+`qwen-asr-audio-encoder --backend sched` run reported about 244 ms of one-time
+backend initialization and 794 ms hot encoder time.
 
 For the decoder input assembly boundary, `benchmarks/check_decoder_input.py`
 matches the Torch prompt embedding plus `masked_scatter` path at `4.09e-6` max
 absolute error on JFK with English forced output. `benchmarks/bench_decoder_input.py`
-measured roughly 5.6-6.2 s for the original C++ GGML audio path with 8 CPU
-threads, 0.84-0.90 s with `--audio-backend sched`, 365 ms for Torch CPU FP32,
-and 7.21 ms for Torch CUDA BF16. A direct
-`qwen-asr-decoder-input --audio-backend sched` run reported about 176 ms of
-one-time backend initialization and 888 ms hot decoder-input time.
+measured roughly 7.5-7.8 s for the original C++ GGML audio path with 8 CPU
+threads, 0.62-0.64 s with `--audio-backend sched`, 347 ms for Torch CPU FP32,
+and 7.23 ms for Torch CUDA BF16. A direct
+`qwen-asr-decoder-input --audio-backend sched` run reported about 184 ms of
+one-time backend initialization and 766 ms hot decoder-input time.
 
 ## Implementation Notes
 
@@ -359,7 +364,7 @@ scalar and GGML implementations of the first audio Conv2D layer, and a validated
 GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
 position embeddings, valid-frame packing, all audio transformer layers, post
 normalization, the audio projector, decoder input embedding assembly, and a
-qwentts.cpp-style scheduled backend for the full audio transformer/projector
-that is also wired through decoder input assembly.
+qwentts.cpp-style scheduled backend for the audio CNN, transformer, and
+projector that is also wired through decoder input assembly.
 The remaining native work is to port the Qwen3 decoder/KV cache and extend the
-persistent backend path through the remaining frontend graphs.
+persistent backend path through the remaining standalone frontend tools.

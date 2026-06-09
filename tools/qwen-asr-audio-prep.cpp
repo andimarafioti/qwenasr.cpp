@@ -16,6 +16,7 @@
 static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out prep.f32] [--threads N]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched]\n"
         << "\n"
         << "Run native Qwen3-ASR audio CNN, positional embedding, and valid-frame packing.\n";
 }
@@ -49,6 +50,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string audio_path;
     std::string out_path;
+    std::string backend = "ggml";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -61,6 +63,18 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             out_path = argv[i];
+            continue;
+        }
+        if (arg == "--backend") {
+            if (++i >= argc) {
+                std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
+            backend = argv[i];
+            if (backend != "ggml" && backend != "sched") {
+                std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
             continue;
         }
         if (arg == "--threads") {
@@ -120,9 +134,33 @@ int main(int argc, char ** argv) {
     }
 
     QwenAsrAudioPrepOutput prep;
-    const auto prep_start = std::chrono::steady_clock::now();
-    const bool prep_ok = qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, &error);
-    const auto prep_end = std::chrono::steady_clock::now();
+    double init_ms = 0.0;
+    auto prep_start = std::chrono::steady_clock::now();
+    auto prep_end = prep_start;
+    bool prep_ok = false;
+    if (backend == "ggml") {
+        prep_ok = qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, &error);
+        prep_end = std::chrono::steady_clock::now();
+    } else {
+        const auto init_start = std::chrono::steady_clock::now();
+        QwenAsrAudioPrepBackend * prep_backend = nullptr;
+        if (!qwenasr_audio_prep_backend_init(
+                model,
+                n_threads,
+                static_cast<int>(cfg.audio_num_mel_bins),
+                &prep_backend,
+                &error)) {
+            qwenasr_gguf_model_close(&model);
+            std::cerr << error << "\n";
+            return 1;
+        }
+        const auto init_end = std::chrono::steady_clock::now();
+        init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
+        prep_start = std::chrono::steady_clock::now();
+        prep_ok = qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error);
+        prep_end = std::chrono::steady_clock::now();
+        qwenasr_audio_prep_backend_free(prep_backend);
+    }
     qwenasr_gguf_model_close(&model);
     if (!prep_ok) {
         std::cerr << error << "\n";
@@ -146,8 +184,9 @@ int main(int argc, char ** argv) {
     const double prep_ms =
         std::chrono::duration<double, std::milli>(prep_end - prep_start).count();
 
-    std::cout << "backend=ggml\n";
+    std::cout << "backend=" << backend << "\n";
     std::cout << "threads=" << n_threads << "\n";
+    std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "prep_ms=" << prep_ms << "\n";
     std::cout << "sample_rate=" << sample_rate << "\n";
     std::cout << "samples=" << samples.size() << "\n";

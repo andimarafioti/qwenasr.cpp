@@ -32,6 +32,8 @@ struct QwenAsrAudioPrepOutput {
     std::vector<float> values; // [token, hidden]
 };
 
+struct QwenAsrAudioPrepBackend;
+
 bool qwenasr_audio_conv0_forward(
     const QwenAsrGgufModel & model,
     const QwenAsrFeatures & features,
@@ -56,5 +58,20 @@ bool qwenasr_audio_prep_forward_ggml(
     const QwenAsrGgufModel & model,
     const QwenAsrFeatures & features,
     int n_threads,
+    QwenAsrAudioPrepOutput * out,
+    std::string * error);
+
+bool qwenasr_audio_prep_backend_init(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_mels,
+    QwenAsrAudioPrepBackend ** out,
+    std::string * error);
+
+void qwenasr_audio_prep_backend_free(QwenAsrAudioPrepBackend * backend);
+
+bool qwenasr_audio_prep_backend_forward(
+    QwenAsrAudioPrepBackend * backend,
+    const QwenAsrFeatures & features,
     QwenAsrAudioPrepOutput * out,
     std::string * error);

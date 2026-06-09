@@ -181,7 +181,18 @@ int main(int argc, char ** argv) {
         end = std::chrono::steady_clock::now();
     } else {
         const auto init_start = std::chrono::steady_clock::now();
+        QwenAsrAudioPrepBackend * prep_backend = nullptr;
         QwenAsrAudioEncoderBackend * encoder_backend = nullptr;
+        if (!qwenasr_audio_prep_backend_init(
+                model,
+                n_threads,
+                static_cast<int>(cfg.audio_num_mel_bins),
+                &prep_backend,
+                &error)) {
+            qwenasr_gguf_model_close(&model);
+            std::cerr << error << "\n";
+            return 1;
+        }
         if (!qwenasr_audio_encoder_backend_init(
                 model,
                 n_threads,
@@ -191,6 +202,7 @@ int main(int argc, char ** argv) {
                 static_cast<int>(cfg.audio_output_dim),
                 &encoder_backend,
                 &error)) {
+            qwenasr_audio_prep_backend_free(prep_backend);
             qwenasr_gguf_model_close(&model);
             std::cerr << error << "\n";
             return 1;
@@ -202,7 +214,7 @@ int main(int argc, char ** argv) {
         QwenAsrAudioEncoderOutput audio;
         start = std::chrono::steady_clock::now();
         ok =
-            qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, &error) &&
+            qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error) &&
             qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &audio, &error) &&
             qwenasr_decoder_input_from_audio(
                 model,
@@ -215,6 +227,7 @@ int main(int argc, char ** argv) {
                 &error);
         end = std::chrono::steady_clock::now();
         qwenasr_audio_encoder_backend_free(encoder_backend);
+        qwenasr_audio_prep_backend_free(prep_backend);
     }
     qwenasr_gguf_model_close(&model);
     if (!ok) {
