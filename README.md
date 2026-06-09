@@ -116,6 +116,15 @@ The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
 ./build/qwen-asr-gguf-info qwen3-asr-0.6b-f32.gguf
 ```
 
+The native audio frontend is available as `qwen-asr-features`. It currently
+supports 16 kHz WAV input and matches the HF `WhisperFeatureExtractor` path used
+by Qwen3-ASR:
+
+```bash
+./build/qwen-asr-features sample.wav --out features.f32
+python benchmarks/check_audio_features.py sample.wav --local-files-only
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
