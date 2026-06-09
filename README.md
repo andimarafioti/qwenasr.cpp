@@ -154,11 +154,13 @@ python benchmarks/check_audio_features.py sample.wav --local-files-only
 ```
 
 The first mapped-weight native audio layer is available as
-`qwen-asr-audio-conv`. It runs `audio.conv.0.*` from a GGUF and can be checked
-against the original HF checkpoint tensors:
+`qwen-asr-audio-conv`. It runs `audio.conv.0.*` from a GGUF through a GGML graph
+by default, keeps the scalar backend for comparison, and can be checked against
+the original HF checkpoint tensors:
 
 ```bash
 ./build/qwen-asr-audio-conv qwen3-asr-0.6b-conv0.gguf sample.wav --out conv0.f32
+./build/qwen-asr-audio-conv qwen3-asr-0.6b-conv0.gguf sample.wav --backend scalar
 python benchmarks/check_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav
 ```
 
@@ -188,6 +190,7 @@ python benchmarks/throughput.py sample.wav --size 0.6B --backend torch --repeat 
 python benchmarks/profile_torch.py sample.wav --size 0.6B --language English
 python benchmarks/compare_parakeet.py sample.wav --qwen-size 0.6B
 python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --language English
+python benchmarks/bench_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -220,6 +223,13 @@ processor prep, 25 ms audio/text prefill, and 261 ms CUDA graph decoding for 26
 generated tokens. The current bottleneck is therefore the Qwen decoder's
 single-token autoregressive loop, not Python tokenization or audio loading.
 
+The native conv0 microbenchmark on the same clip currently shows the first GGML
+graph path is correct but not yet competitive: with 8 CPU threads,
+`benchmarks/bench_audio_conv0.py` measured roughly 286 ms best for C++ GGML,
+170 ms for the scalar C++ loop, and 1.24 ms for Torch CUDA BF16. That makes the
+next native speed target clear: avoid per-call graph/setup/output-copy overhead
+and move the remaining audio tower into reusable GGML/backend graphs.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -239,7 +249,7 @@ The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
 CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
 the C++ surface and comparison harness, and the native path now covers GGUF
 metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
-BPE prompt expansion. It also has a mapped GGUF tensor-data loader and a
-validated scalar implementation of the first audio Conv2D layer. The remaining
+BPE prompt expansion. It also has a mapped GGUF tensor-data loader and validated
+scalar and GGML implementations of the first audio Conv2D layer. The remaining
 native work is to port the rest of the ASR audio tower/projector and Qwen3
 decoder/KV cache into GGML.

@@ -72,11 +72,31 @@ def _dump_native_features(features_bin: Path, audio: Path) -> tuple[np.ndarray, 
     return features, meta
 
 
-def _dump_native_conv(conv_bin: Path, gguf: Path, audio: Path) -> tuple[np.ndarray, dict[str, str]]:
+def _dump_native_conv(
+    conv_bin: Path,
+    gguf: Path,
+    audio: Path,
+    backend: str,
+    n_threads: int,
+) -> tuple[np.ndarray, dict[str, str]]:
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
-        meta = _parse_kv(_run([str(conv_bin), str(gguf), str(audio), "--out", str(tmp_path)]))
+        meta = _parse_kv(
+            _run(
+                [
+                    str(conv_bin),
+                    str(gguf),
+                    str(audio),
+                    "--backend",
+                    backend,
+                    "--threads",
+                    str(n_threads),
+                    "--out",
+                    str(tmp_path),
+                ]
+            )
+        )
         conv = np.fromfile(tmp_path, dtype=np.float32).reshape(
             int(meta["chunks"]),
             int(meta["channels"]),
@@ -112,6 +132,8 @@ def main() -> int:
     parser.add_argument("audio", type=Path)
     parser.add_argument("--cpp-bin", default=str(ROOT / "build" / "qwen-asr-audio-conv"))
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
+    parser.add_argument("--native-backend", choices=("ggml", "scalar"), default="ggml")
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--atol", type=float, default=2e-5)
     args = parser.parse_args()
 
@@ -123,7 +145,13 @@ def main() -> int:
         raise SystemExit(f"C++ feature binary not found: {features_bin}")
 
     features, feature_meta = _dump_native_features(features_bin, args.audio)
-    native, conv_meta = _dump_native_conv(conv_bin, args.gguf, args.audio)
+    native, conv_meta = _dump_native_conv(
+        conv_bin,
+        args.gguf,
+        args.audio,
+        args.native_backend,
+        args.threads,
+    )
     ref_chunks = _build_chunks(features, feature_meta)
 
     try:
@@ -145,6 +173,8 @@ def main() -> int:
     diff = np.abs(native - ref)
     max_abs = float(diff.max())
     print(f"shape={native.shape}")
+    print(f"native_backend={conv_meta['backend']}")
+    print(f"native_conv_ms={float(conv_meta['conv_ms']):.3f}")
     print(f"feature_frames={feature_meta['frames']}")
     print(f"chunks={conv_meta['chunks']}")
     print(f"max_abs={max_abs:.8f}")

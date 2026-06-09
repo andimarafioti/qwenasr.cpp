@@ -4,15 +4,19 @@
 #include "native-model.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void usage(const char * argv0) {
     std::cerr
-        << "Usage: " << argv0 << " model.gguf audio.wav [--out conv0.f32]\n"
+        << "Usage: " << argv0 << " model.gguf audio.wav [--out conv0.f32]"
+        << " [--backend ggml|scalar] [--threads N]\n"
         << "\n"
         << "Run the native mapped-weight Qwen3-ASR first audio Conv2D layer.\n";
 }
@@ -41,9 +45,12 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    const unsigned hw_threads = std::thread::hardware_concurrency();
+    int n_threads = hw_threads == 0 ? 1 : static_cast<int>(hw_threads);
     std::string model_path;
     std::string audio_path;
     std::string out_path;
+    std::string backend = "ggml";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -56,6 +63,28 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             out_path = argv[i];
+            continue;
+        }
+        if (arg == "--backend") {
+            if (++i >= argc) {
+                std::cerr << "--backend requires ggml or scalar\n";
+                return 2;
+            }
+            backend = argv[i];
+            continue;
+        }
+        if (arg == "--threads") {
+            if (++i >= argc) {
+                std::cerr << "--threads requires a positive integer\n";
+                return 2;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(argv[i], &end, 10);
+            if (!end || *end != '\0' || parsed <= 0) {
+                std::cerr << "--threads requires a positive integer\n";
+                return 2;
+            }
+            n_threads = static_cast<int>(parsed);
             continue;
         }
         if (model_path.empty()) {
@@ -72,6 +101,10 @@ int main(int argc, char ** argv) {
 
     if (model_path.empty() || audio_path.empty()) {
         std::cerr << "model GGUF and audio WAV are required\n";
+        return 2;
+    }
+    if (backend != "ggml" && backend != "scalar") {
+        std::cerr << "--backend must be ggml or scalar\n";
         return 2;
     }
 
@@ -101,7 +134,15 @@ int main(int argc, char ** argv) {
     }
 
     QwenAsrConv2dOutput conv;
-    if (!qwenasr_audio_conv0_forward(model, features, &conv, &error)) {
+    const auto conv_start = std::chrono::steady_clock::now();
+    bool conv_ok = false;
+    if (backend == "ggml") {
+        conv_ok = qwenasr_audio_conv0_forward_ggml(model, features, n_threads, &conv, &error);
+    } else {
+        conv_ok = qwenasr_audio_conv0_forward(model, features, &conv, &error);
+    }
+    const auto conv_end = std::chrono::steady_clock::now();
+    if (!conv_ok) {
         qwenasr_gguf_model_close(&model);
         std::cerr << error << "\n";
         return 1;
@@ -122,6 +163,12 @@ int main(int argc, char ** argv) {
         sum += value;
     }
 
+    const double conv_ms =
+        std::chrono::duration<double, std::milli>(conv_end - conv_start).count();
+
+    std::cout << "backend=" << backend << "\n";
+    std::cout << "threads=" << n_threads << "\n";
+    std::cout << "conv_ms=" << conv_ms << "\n";
     std::cout << "sample_rate=" << sample_rate << "\n";
     std::cout << "samples=" << samples.size() << "\n";
     std::cout << "feature_mels=" << features.n_mels << "\n";

@@ -21,3 +21,10 @@ bool qwenasr_audio_conv0_forward(
     const QwenAsrFeatures & features,
     QwenAsrConv2dOutput * out,
     std::string * error);
+
+bool qwenasr_audio_conv0_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    QwenAsrConv2dOutput * out,
+    std::string * error);
