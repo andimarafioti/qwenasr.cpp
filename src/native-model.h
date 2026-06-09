@@ -28,9 +28,19 @@ struct QwenAsrNativeConfig {
     float    text_rope_theta = 0.0f;
     float    text_rms_norm_eps = 0.0f;
 
+    std::string tokenizer_model;
+    size_t      tokenizer_n_tokens = 0;
+    size_t      tokenizer_n_token_types = 0;
+    size_t      tokenizer_n_merges = 0;
+    uint32_t    tokenizer_eos = 0;
+
+    uint32_t token_endoftext = 0;
+    uint32_t token_im_start = 0;
+    uint32_t token_im_end = 0;
     uint32_t token_audio = 0;
     uint32_t token_audio_start = 0;
     uint32_t token_audio_end = 0;
+    uint32_t token_asr_text = 0;
 
     int64_t n_kv = 0;
     int64_t n_tensors = 0;

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -22,6 +23,14 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without optiona
 
 
 ARCH = "qwen3-asr"
+
+
+@dataclass(frozen=True)
+class BpeMetadata:
+    tokens: list[str]
+    token_types: list[int]
+    merges: list[str]
+    token_ids: dict[str, int]
 
 
 def _load_config(checkpoint: Path) -> dict:
@@ -36,6 +45,51 @@ def _iter_safetensors(checkpoint: Path) -> list[Path]:
     if not files:
         raise FileNotFoundError(f"no safetensors files found in {checkpoint}")
     return files
+
+
+def load_bpe_vocab(checkpoint: Path, vocab_size: int) -> BpeMetadata:
+    vocab_path = checkpoint / "vocab.json"
+    merges_path = checkpoint / "merges.txt"
+    tokenizer_config_path = checkpoint / "tokenizer_config.json"
+    if not vocab_path.is_file():
+        raise FileNotFoundError(f"missing vocab.json in {checkpoint}")
+    if not merges_path.is_file():
+        raise FileNotFoundError(f"missing merges.txt in {checkpoint}")
+    if not tokenizer_config_path.is_file():
+        raise FileNotFoundError(f"missing tokenizer_config.json in {checkpoint}")
+
+    vocab = json.loads(vocab_path.read_text())
+    tok_cfg = json.loads(tokenizer_config_path.read_text())
+    added = tok_cfg.get("added_tokens_decoder", {})
+
+    max_id = max(max(vocab.values()), vocab_size - 1)
+    for sid in added.keys():
+        max_id = max(max_id, int(sid))
+
+    tokens: list[str | None] = [None] * (max_id + 1)
+    token_types = [1] * (max_id + 1)  # 1 = normal
+    token_ids: dict[str, int] = {}
+
+    for token, token_id in vocab.items():
+        tokens[token_id] = token
+        token_ids[token] = token_id
+
+    for sid_str, info in added.items():
+        token_id = int(sid_str)
+        token = info["content"]
+        tokens[token_id] = token
+        token_ids[token] = token_id
+        token_types[token_id] = 4  # 4 = user-defined / special
+
+    for i, token in enumerate(tokens):
+        if token is None:
+            tokens[i] = f"<|unused-{i}|>"
+            token_types[i] = 5  # 5 = unused
+
+    merges_lines = merges_path.read_text().splitlines()
+    merges = [line for line in merges_lines if line and not line.startswith("#")]
+
+    return BpeMetadata(tokens=[str(token) for token in tokens], token_types=token_types, merges=merges, token_ids=token_ids)
 
 
 def rename_tensor(name: str) -> str:
@@ -278,11 +332,30 @@ def _add_metadata(writer, cfg: dict) -> None:
     writer.add_uint32("qwen3-asr.token.audio_end_token_id", thinker.get("audio_end_token_id", 151670))
 
 
+def _add_tokenizer_metadata(writer, tokenizer: BpeMetadata) -> None:
+    endoftext_id = tokenizer.token_ids.get("<|endoftext|>", 151643)
+    im_start_id = tokenizer.token_ids.get("<|im_start|>", 151644)
+    im_end_id = tokenizer.token_ids.get("<|im_end|>", 151645)
+    asr_text_id = tokenizer.token_ids.get("<asr_text>", 151704)
+
+    writer.add_string("tokenizer.ggml.model", "gpt2")
+    writer.add_array("tokenizer.ggml.tokens", tokenizer.tokens)
+    writer.add_array("tokenizer.ggml.token_type", tokenizer.token_types)
+    writer.add_array("tokenizer.ggml.merges", tokenizer.merges)
+    writer.add_uint32("tokenizer.ggml.eos_token_id", im_end_id)
+
+    writer.add_uint32("qwen3-asr.token.endoftext_token_id", endoftext_id)
+    writer.add_uint32("qwen3-asr.token.im_start_token_id", im_start_id)
+    writer.add_uint32("qwen3-asr.token.im_end_token_id", im_end_id)
+    writer.add_uint32("qwen3-asr.token.asr_text_token_id", asr_text_id)
+
+
 def write_gguf(
     checkpoint: Path,
     out_path: Path,
     tensor_map: dict[str, str],
     cfg: dict,
+    tokenizer: BpeMetadata,
     *,
     metadata_only: bool = False,
 ) -> None:
@@ -293,6 +366,7 @@ def write_gguf(
 
     writer = gguf.GGUFWriter(str(out_path), ARCH)
     _add_metadata(writer, cfg)
+    _add_tokenizer_metadata(writer, tokenizer)
 
     if not metadata_only:
         files = _iter_safetensors(checkpoint)
@@ -326,19 +400,22 @@ def main() -> int:
 
     cfg = _load_config(args.checkpoint)
     files = _iter_safetensors(args.checkpoint)
+    thinker = cfg.get("thinker_config", cfg)
+    tokenizer = load_bpe_vocab(args.checkpoint, thinker["text_config"]["vocab_size"])
     shape_specs = expected_hf_shapes(cfg)
     tensor_map = collect_tensor_map(files, expected_shapes=shape_specs)
 
     if args.dump_map:
         args.dump_map.write_text(json.dumps(tensor_map, indent=2, sort_keys=True) + "\n")
 
-    thinker = cfg.get("thinker_config", cfg)
     text_layers = thinker["text_config"]["num_hidden_layers"]
     audio_layers = thinker["audio_config"]["encoder_layers"]
     print(f"checkpoint={args.checkpoint}")
     print(f"safetensors={len(files)}")
     print(f"tensors={len(tensor_map)}")
     print(f"shape_checks={len(shape_specs)}")
+    print(f"tokenizer_tokens={len(tokenizer.tokens)}")
+    print(f"tokenizer_merges={len(tokenizer.merges)}")
     print(f"text_layers={text_layers}")
     print(f"audio_layers={audio_layers}")
 
@@ -346,7 +423,7 @@ def main() -> int:
         print("status=dry-run-ok")
         return 0
 
-    write_gguf(args.checkpoint, args.out, tensor_map, cfg, metadata_only=args.metadata_only)
+    write_gguf(args.checkpoint, args.out, tensor_map, cfg, tokenizer, metadata_only=args.metadata_only)
     print(f"wrote={args.out}")
     if args.metadata_only:
         print("metadata_only=true")

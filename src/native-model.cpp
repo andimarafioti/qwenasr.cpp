@@ -50,6 +50,34 @@ static bool get_str(const gguf_context * ctx, const char * key, std::string * ou
     return true;
 }
 
+static bool get_arr_n(
+    const gguf_context * ctx,
+    const char * key,
+    enum gguf_type expected_type,
+    size_t * out,
+    std::string * error) {
+    int64_t id = -1;
+    if (!require_key(ctx, key, &id, error)) {
+        return false;
+    }
+    if (gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) {
+        if (error) {
+            *error = std::string("GGUF key is not an array: ") + key;
+        }
+        return false;
+    }
+    if (gguf_get_arr_type(ctx, id) != expected_type) {
+        if (error) {
+            *error = std::string("GGUF array type mismatch for ") + key +
+                ": expected " + gguf_type_name(expected_type) +
+                " got " + gguf_type_name(gguf_get_arr_type(ctx, id));
+        }
+        return false;
+    }
+    *out = gguf_get_arr_n(ctx, id);
+    return true;
+}
+
 static std::string shape_string(const int64_t * ne, int n_dims) {
     std::ostringstream ss;
     ss << "[";
@@ -176,13 +204,50 @@ bool qwenasr_load_gguf_metadata(
     ok = ok && get_u32(ctx, "qwen3-asr.text.head_dim", &cfg.text_head_dim, error);
     ok = ok && get_f32(ctx, "qwen3-asr.text.rope_theta", &cfg.text_rope_theta, error);
     ok = ok && get_f32(ctx, "qwen3-asr.text.rms_norm_eps", &cfg.text_rms_norm_eps, error);
+    ok = ok && get_str(ctx, "tokenizer.ggml.model", &cfg.tokenizer_model, error);
+    ok = ok && get_arr_n(ctx, "tokenizer.ggml.tokens", GGUF_TYPE_STRING, &cfg.tokenizer_n_tokens, error);
+    ok = ok && get_arr_n(ctx, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, &cfg.tokenizer_n_token_types, error);
+    ok = ok && get_arr_n(ctx, "tokenizer.ggml.merges", GGUF_TYPE_STRING, &cfg.tokenizer_n_merges, error);
+    ok = ok && get_u32(ctx, "tokenizer.ggml.eos_token_id", &cfg.tokenizer_eos, error);
+    ok = ok && get_u32(ctx, "qwen3-asr.token.endoftext_token_id", &cfg.token_endoftext, error);
+    ok = ok && get_u32(ctx, "qwen3-asr.token.im_start_token_id", &cfg.token_im_start, error);
+    ok = ok && get_u32(ctx, "qwen3-asr.token.im_end_token_id", &cfg.token_im_end, error);
     ok = ok && get_u32(ctx, "qwen3-asr.token.audio_token_id", &cfg.token_audio, error);
     ok = ok && get_u32(ctx, "qwen3-asr.token.audio_start_token_id", &cfg.token_audio_start, error);
     ok = ok && get_u32(ctx, "qwen3-asr.token.audio_end_token_id", &cfg.token_audio_end, error);
+    ok = ok && get_u32(ctx, "qwen3-asr.token.asr_text_token_id", &cfg.token_asr_text, error);
 
     if (ok && cfg.arch != "qwen3-asr") {
         if (error) {
             *error = "GGUF arch is not qwen3-asr";
+        }
+        ok = false;
+    }
+
+    if (ok && cfg.tokenizer_model != "gpt2") {
+        if (error) {
+            *error = "GGUF tokenizer model is not gpt2";
+        }
+        ok = false;
+    }
+
+    if (ok && cfg.tokenizer_n_tokens != cfg.tokenizer_n_token_types) {
+        if (error) {
+            *error = "GGUF tokenizer token/type count mismatch";
+        }
+        ok = false;
+    }
+
+    if (ok && cfg.tokenizer_n_tokens < cfg.text_vocab_size) {
+        if (error) {
+            *error = "GGUF tokenizer has fewer tokens than text vocab size";
+        }
+        ok = false;
+    }
+
+    if (ok && cfg.tokenizer_eos != cfg.token_im_end) {
+        if (error) {
+            *error = "GGUF tokenizer EOS does not match qwen3-asr im_end token";
         }
         ok = false;
     }
@@ -332,9 +397,42 @@ bool qwenasr_write_metadata_fixture(const char * path, std::string * error) {
     gguf_set_val_u32(ctx, "qwen3-asr.text.head_dim", 128);
     gguf_set_val_f32(ctx, "qwen3-asr.text.rope_theta", 1000000.0f);
     gguf_set_val_f32(ctx, "qwen3-asr.text.rms_norm_eps", 0.000001f);
+    std::vector<std::string> token_strings(151936);
+    std::vector<const char *> token_ptrs(151936);
+    std::vector<int32_t> token_types(151936, 5);
+    for (size_t i = 0; i < token_strings.size(); ++i) {
+        token_strings[i] = "<|unused-" + std::to_string(i) + "|>";
+    }
+    token_strings[151643] = "<|endoftext|>";
+    token_strings[151644] = "<|im_start|>";
+    token_strings[151645] = "<|im_end|>";
+    token_strings[151669] = "<|audio_start|>";
+    token_strings[151670] = "<|audio_end|>";
+    token_strings[151676] = "<|audio_pad|>";
+    token_strings[151704] = "<asr_text>";
+    for (size_t i = 0; i < token_strings.size(); ++i) {
+        token_ptrs[i] = token_strings[i].c_str();
+    }
+    token_types[151643] = 4;
+    token_types[151644] = 4;
+    token_types[151645] = 4;
+    token_types[151669] = 4;
+    token_types[151670] = 4;
+    token_types[151676] = 4;
+    token_types[151704] = 4;
+    const char * merges[] = { "a b" };
+    gguf_set_val_str(ctx, "tokenizer.ggml.model", "gpt2");
+    gguf_set_arr_str(ctx, "tokenizer.ggml.tokens", token_ptrs.data(), token_ptrs.size());
+    gguf_set_arr_data(ctx, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, token_types.data(), token_types.size());
+    gguf_set_arr_str(ctx, "tokenizer.ggml.merges", merges, 1);
+    gguf_set_val_u32(ctx, "tokenizer.ggml.eos_token_id", 151645);
+    gguf_set_val_u32(ctx, "qwen3-asr.token.endoftext_token_id", 151643);
+    gguf_set_val_u32(ctx, "qwen3-asr.token.im_start_token_id", 151644);
+    gguf_set_val_u32(ctx, "qwen3-asr.token.im_end_token_id", 151645);
     gguf_set_val_u32(ctx, "qwen3-asr.token.audio_token_id", 151676);
     gguf_set_val_u32(ctx, "qwen3-asr.token.audio_start_token_id", 151669);
     gguf_set_val_u32(ctx, "qwen3-asr.token.audio_end_token_id", 151670);
+    gguf_set_val_u32(ctx, "qwen3-asr.token.asr_text_token_id", 151704);
 
     const bool ok = gguf_write_to_file(ctx, path, true);
     gguf_free(ctx);

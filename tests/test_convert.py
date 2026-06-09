@@ -1,6 +1,8 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from convert import expected_hf_shapes
+from convert import expected_hf_shapes, load_bpe_vocab
 
 
 def _cfg(*, audio_hidden=896, audio_layers=18, text_hidden=1024, text_intermediate=3072):
@@ -47,6 +49,24 @@ class ConvertShapeTest(unittest.TestCase):
         self.assertEqual(shapes["text.blk.0.ffn_up.weight"], (6144, 2048))
         self.assertEqual(shapes["audio.conv_out.weight"], (1024, 7680))
         self.assertEqual(shapes["audio.proj.1.weight"], (2048, 1024))
+
+
+class ConvertTokenizerTest(unittest.TestCase):
+    def test_load_bpe_vocab_fills_model_vocab_and_added_tokens(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vocab.json").write_text('{"a": 0, "b": 2}\n')
+            (root / "merges.txt").write_text("#version: 0.2\na b\n")
+            (root / "tokenizer_config.json").write_text(
+                '{"added_tokens_decoder": {"4": {"content": "<|im_end|>"}}}\n'
+            )
+
+            meta = load_bpe_vocab(root, vocab_size=6)
+
+        self.assertEqual(meta.tokens, ["a", "<|unused-1|>", "b", "<|unused-3|>", "<|im_end|>", "<|unused-5|>"])
+        self.assertEqual(meta.token_types, [1, 5, 1, 5, 4, 5])
+        self.assertEqual(meta.merges, ["a b"])
+        self.assertEqual(meta.token_ids["<|im_end|>"], 4)
 
 
 if __name__ == "__main__":
