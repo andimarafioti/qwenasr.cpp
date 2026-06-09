@@ -116,6 +116,7 @@ python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-meta.gguf --metadata-only
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-conv0.gguf --include-tensor-prefix audio.conv.0.
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-cnn.gguf --include-tensor-prefix audio.conv. --include-tensor-prefix audio.conv_out.
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-layer0.gguf --include-tensor-prefix audio.conv. --include-tensor-prefix audio.conv_out. --include-tensor-prefix audio.blk.0.
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
@@ -184,6 +185,16 @@ by the audio transformer:
 python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
 ```
 
+The first audio transformer block is available as a native CPU reference in
+`qwen-asr-audio-layer`. It targets the current eager-attention Torch path and is
+intended to validate tensor names/layouts before moving the block to optimized
+GGML graphs:
+
+```bash
+./build/qwen-asr-audio-layer qwen3-asr-0.6b-audio-layer0.gguf sample.wav --out audio-layer0.f32
+python benchmarks/check_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-layer0.gguf sample.wav
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
@@ -213,6 +224,7 @@ python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --langua
 python benchmarks/bench_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
+python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-layer0.gguf sample.wav --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -264,6 +276,13 @@ CPU FP32, and 2.46 ms for Torch CUDA BF16. The output matches PyTorch at
 `1.53e-5` max absolute error and produces the JFK attention segments
 `[(0, 104), (104, 39)]`.
 
+For the first audio encoder block, `benchmarks/bench_audio_layer0.py` measured
+roughly 1.30 s best for the native CPU reference, 115 ms for Torch CPU FP32, and
+2.72 ms for Torch CUDA BF16. The layer output matches the current eager Torch
+path at `1.42e-5` max absolute error. This layer is deliberately a correctness
+reference; the next speed work is replacing its scalar matmuls/attention with
+GGML/backend graph operations.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -286,5 +305,6 @@ metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
 BPE prompt expansion. It also has a mapped GGUF tensor-data loader, validated
 scalar and GGML implementations of the first audio Conv2D layer, and a validated
 GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
-position embeddings, and valid-frame packing. The remaining native work is to
-port the audio transformer/projector and Qwen3 decoder/KV cache into GGML.
+position embeddings, valid-frame packing, and a native CPU reference for the
+first audio transformer block. The remaining native work is to port the full
+audio transformer/projector and Qwen3 decoder/KV cache into GGML.

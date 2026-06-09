@@ -34,6 +34,7 @@ add_library(qwenasr_native STATIC
     src/gguf-model.cpp
     src/audio-features.cpp
     src/audio-conv.cpp
+    src/audio-encoder.cpp
     src/tokenizer.cpp
 )
 target_include_directories(qwenasr_native PUBLIC
@@ -74,3 +75,7 @@ qwenasr_compile_options(qwen-asr-audio-cnn)
 add_executable(qwen-asr-audio-prep tools/qwen-asr-audio-prep.cpp)
 target_link_libraries(qwen-asr-audio-prep PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-audio-prep)
+
+add_executable(qwen-asr-audio-layer tools/qwen-asr-audio-layer.cpp)
+target_link_libraries(qwen-asr-audio-layer PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-audio-layer)
