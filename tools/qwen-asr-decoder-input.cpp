@@ -18,6 +18,7 @@ static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out decoder-input.f32] [--threads N]\n"
         << "       " << argv0 << " model.gguf audio.wav [--language NAME] [--system TEXT]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched]\n"
         << "\n"
         << "Build native Qwen3-ASR decoder input embeddings from text prompt and audio embeddings.\n";
 }
@@ -53,6 +54,7 @@ int main(int argc, char ** argv) {
     std::string out_path;
     std::string language;
     std::string system_text;
+    std::string audio_backend = "ggml";
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -81,6 +83,18 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             system_text = argv[i];
+            continue;
+        }
+        if (arg == "--audio-backend") {
+            if (++i >= argc) {
+                std::cerr << "--audio-backend requires ggml or sched\n";
+                return 2;
+            }
+            audio_backend = argv[i];
+            if (audio_backend != "ggml" && audio_backend != "sched") {
+                std::cerr << "--audio-backend requires ggml or sched\n";
+                return 2;
+            }
             continue;
         }
         if (arg == "--threads") {
@@ -146,21 +160,62 @@ int main(int argc, char ** argv) {
     }
 
     QwenAsrDecoderInputOutput decoder_input;
-    const auto start = std::chrono::steady_clock::now();
-    const bool ok = qwenasr_decoder_input_forward_ggml(
-        model,
-        tokenizer,
-        features,
-        n_threads,
-        static_cast<int>(cfg.audio_encoder_layers),
-        static_cast<int>(cfg.audio_encoder_attention_heads),
-        static_cast<int>(cfg.audio_output_dim),
-        static_cast<int>(cfg.token_audio),
-        system_text,
-        language,
-        &decoder_input,
-        &error);
-    const auto end = std::chrono::steady_clock::now();
+    double init_ms = 0.0;
+    auto start = std::chrono::steady_clock::now();
+    auto end = start;
+    bool ok = false;
+    if (audio_backend == "ggml") {
+        ok = qwenasr_decoder_input_forward_ggml(
+            model,
+            tokenizer,
+            features,
+            n_threads,
+            static_cast<int>(cfg.audio_encoder_layers),
+            static_cast<int>(cfg.audio_encoder_attention_heads),
+            static_cast<int>(cfg.audio_output_dim),
+            static_cast<int>(cfg.token_audio),
+            system_text,
+            language,
+            &decoder_input,
+            &error);
+        end = std::chrono::steady_clock::now();
+    } else {
+        const auto init_start = std::chrono::steady_clock::now();
+        QwenAsrAudioEncoderBackend * encoder_backend = nullptr;
+        if (!qwenasr_audio_encoder_backend_init(
+                model,
+                n_threads,
+                static_cast<int>(cfg.audio_encoder_layers),
+                static_cast<int>(cfg.audio_encoder_attention_heads),
+                static_cast<int>(cfg.audio_d_model),
+                static_cast<int>(cfg.audio_output_dim),
+                &encoder_backend,
+                &error)) {
+            qwenasr_gguf_model_close(&model);
+            std::cerr << error << "\n";
+            return 1;
+        }
+        const auto init_end = std::chrono::steady_clock::now();
+        init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
+
+        QwenAsrAudioPrepOutput prep;
+        QwenAsrAudioEncoderOutput audio;
+        start = std::chrono::steady_clock::now();
+        ok =
+            qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, &error) &&
+            qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &audio, &error) &&
+            qwenasr_decoder_input_from_audio(
+                model,
+                tokenizer,
+                audio,
+                static_cast<int>(cfg.token_audio),
+                system_text,
+                language,
+                &decoder_input,
+                &error);
+        end = std::chrono::steady_clock::now();
+        qwenasr_audio_encoder_backend_free(encoder_backend);
+    }
     qwenasr_gguf_model_close(&model);
     if (!ok) {
         std::cerr << error << "\n";
@@ -184,7 +239,9 @@ int main(int argc, char ** argv) {
     const double decoder_input_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
     std::cout << "backend=ggml\n";
+    std::cout << "audio_backend=" << audio_backend << "\n";
     std::cout << "threads=" << n_threads << "\n";
+    std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "decoder_input_ms=" << decoder_input_ms << "\n";
     std::cout << "sample_rate=" << sample_rate << "\n";
     std::cout << "samples=" << samples.size() << "\n";

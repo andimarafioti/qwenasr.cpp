@@ -50,6 +50,7 @@ def _dump_native_decoder_input(
     gguf: Path,
     audio: Path,
     n_threads: int,
+    audio_backend: str,
     system: str,
     language: str,
 ) -> tuple[np.ndarray, dict[str, str], list[int]]:
@@ -62,6 +63,8 @@ def _dump_native_decoder_input(
             str(audio),
             "--threads",
             str(n_threads),
+            "--audio-backend",
+            audio_backend,
             "--out",
             str(tmp_path),
         ]
@@ -129,6 +132,7 @@ def main() -> int:
     parser.add_argument("--heads", type=int, default=14)
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
+    parser.add_argument("--native-audio-backend", choices=("ggml", "sched"), default="ggml")
     parser.add_argument("--atol", type=float, default=5e-3)
     args = parser.parse_args()
 
@@ -145,6 +149,7 @@ def main() -> int:
         args.gguf,
         args.audio,
         args.threads,
+        args.native_audio_backend,
         args.system,
         args.language,
     )
@@ -171,6 +176,7 @@ def main() -> int:
     print(f"shape={native.shape}")
     print(f"audio_tokens={audio_tokens}")
     print(f"native_backend={meta['backend']}")
+    print(f"native_audio_backend={meta['audio_backend']}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
     print(f"max_abs={max_abs:.8f}")
     print(f"mean_abs={float(diff.mean()):.8f}")

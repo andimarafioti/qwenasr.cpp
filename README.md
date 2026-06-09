@@ -215,11 +215,14 @@ python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 The decoder input assembly boundary is available as `qwen-asr-decoder-input`.
 It looks up prompt token embeddings, replaces `<|audio_pad|>` positions with
 the native audio encoder output, and emits the embeddings passed into the Qwen3
-text decoder:
+text decoder. It also supports `--audio-backend sched` to reuse the scheduled
+audio transformer/projector backend:
 
 ```bash
 ./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --out decoder-input.f32
+./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --audio-backend sched --out decoder-input-sched.f32
 python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English
+python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --native-audio-backend sched
 ```
 
 ## Streaming
@@ -326,11 +329,11 @@ encoder time.
 For the decoder input assembly boundary, `benchmarks/check_decoder_input.py`
 matches the Torch prompt embedding plus `masked_scatter` path at `4.09e-6` max
 absolute error on JFK with English forced output. `benchmarks/bench_decoder_input.py`
-measured roughly 6.7-8.1 s for C++ GGML with 8 CPU threads, 371 ms for Torch CPU
-FP32, and 7.25 ms for Torch CUDA BF16. This step verifies the native path reaches
-the exact text-decoder input embeddings; this CLI still calls the original
-one-shot audio encoder path, so the same per-layer graph rebuild cost still
-dominates native time.
+measured roughly 5.6-6.2 s for the original C++ GGML audio path with 8 CPU
+threads, 0.84-0.90 s with `--audio-backend sched`, 365 ms for Torch CPU FP32,
+and 7.21 ms for Torch CUDA BF16. A direct
+`qwen-asr-decoder-input --audio-backend sched` run reported about 176 ms of
+one-time backend initialization and 888 ms hot decoder-input time.
 
 ## Implementation Notes
 
@@ -356,7 +359,7 @@ scalar and GGML implementations of the first audio Conv2D layer, and a validated
 GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
 position embeddings, valid-frame packing, all audio transformer layers, post
 normalization, the audio projector, decoder input embedding assembly, and a
-qwentts.cpp-style scheduled backend for the full audio transformer/projector.
+qwentts.cpp-style scheduled backend for the full audio transformer/projector
+that is also wired through decoder input assembly.
 The remaining native work is to port the Qwen3 decoder/KV cache and extend the
-persistent backend path through decoder input assembly and the remaining
-frontend graphs.
+persistent backend path through the remaining frontend graphs.

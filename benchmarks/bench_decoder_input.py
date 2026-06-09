@@ -37,6 +37,7 @@ def _bench_cpp(
     audio: Path,
     threads: int,
     repeat: int,
+    audio_backend: str,
     system: str,
     language: str,
 ) -> list[float]:
@@ -48,6 +49,8 @@ def _bench_cpp(
             str(audio),
             "--threads",
             str(threads),
+            "--audio-backend",
+            audio_backend,
         ]
         if system:
             cmd += ["--system", system]
@@ -143,6 +146,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
+    parser.add_argument("--cpp-audio-backends", nargs="+", choices=("ggml", "sched"), default=["ggml", "sched"])
     parser.add_argument("--torch-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--torch-threads", type=int, default=None)
@@ -185,15 +189,19 @@ def main() -> int:
     }
     embeddings = _load_checkpoint_tensor(args.checkpoint, TEXT_EMBED_NAME)
 
-    cpp_times = _bench_cpp(
-        decoder_bin,
-        args.gguf,
-        args.audio,
-        args.threads,
-        args.repeat,
-        args.system,
-        args.language,
-    )
+    cpp_results = {
+        backend: _bench_cpp(
+            decoder_bin,
+            args.gguf,
+            args.audio,
+            args.threads,
+            args.repeat,
+            backend,
+            args.system,
+            args.language,
+        )
+        for backend in args.cpp_audio_backends
+    }
     torch_times = _bench_torch(
         chunks,
         chunk_input_lengths,
@@ -209,7 +217,6 @@ def main() -> int:
         args.repeat,
     )
 
-    cpp_best, cpp_mean = _summarize(cpp_times)
     torch_best, torch_mean = _summarize(torch_times)
     print(f"shape=({len(ids)}, {embeddings.shape[1]})")
     print(f"audio_tokens={audio_tokens}")
@@ -218,8 +225,10 @@ def main() -> int:
     print(f"heads={args.heads}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    print(f"cpp_ggml_best_ms={cpp_best:.3f}")
-    print(f"cpp_ggml_mean_ms={cpp_mean:.3f}")
+    for backend, times in cpp_results.items():
+        cpp_best, cpp_mean = _summarize(times)
+        print(f"cpp_{backend}_best_ms={cpp_best:.3f}")
+        print(f"cpp_{backend}_mean_ms={cpp_mean:.3f}")
     print(f"torch_best_ms={torch_best:.3f}")
     print(f"torch_mean_ms={torch_mean:.3f}")
     print("status=ok")

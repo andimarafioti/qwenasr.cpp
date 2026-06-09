@@ -1,7 +1,5 @@
 #include "decoder-input.h"
 
-#include "audio-encoder.h"
-
 #include <cstring>
 
 static void set_error(std::string * error, const std::string & message) {
@@ -25,38 +23,21 @@ static bool require_f32_tensor(
     return true;
 }
 
-bool qwenasr_decoder_input_forward_ggml(
+bool qwenasr_decoder_input_from_audio(
     const QwenAsrGgufModel & model,
     const QwenAsrTokenizer & tokenizer,
-    const QwenAsrFeatures & features,
-    int n_threads,
-    int n_audio_layers,
-    int n_audio_heads,
-    int audio_output_dim,
+    const QwenAsrAudioEncoderOutput & audio,
     int audio_token_id,
     const std::string & system_text,
     const std::string & language,
     QwenAsrDecoderInputOutput * out,
     std::string * error) {
     if (!out) {
-        set_error(error, "qwenasr_decoder_input_forward_ggml: out is null");
+        set_error(error, "qwenasr_decoder_input_from_audio: out is null");
         return false;
     }
-    if (audio_output_dim <= 0 || audio_token_id < 0) {
+    if (audio_token_id < 0) {
         set_error(error, "invalid decoder input configuration");
-        return false;
-    }
-
-    QwenAsrAudioEncoderOutput audio;
-    if (!qwenasr_audio_encoder_forward_ggml(
-            model,
-            features,
-            n_threads,
-            n_audio_layers,
-            n_audio_heads,
-            audio_output_dim,
-            &audio,
-            error)) {
         return false;
     }
     if (audio.tokens <= 0 || audio.hidden <= 0 ||
@@ -117,4 +98,49 @@ bool qwenasr_decoder_input_forward_ggml(
     result.audio_tokens = audio.tokens;
     *out = std::move(result);
     return true;
+}
+
+bool qwenasr_decoder_input_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrTokenizer & tokenizer,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    int n_audio_layers,
+    int n_audio_heads,
+    int audio_output_dim,
+    int audio_token_id,
+    const std::string & system_text,
+    const std::string & language,
+    QwenAsrDecoderInputOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_decoder_input_forward_ggml: out is null");
+        return false;
+    }
+    if (audio_output_dim <= 0 || audio_token_id < 0) {
+        set_error(error, "invalid decoder input configuration");
+        return false;
+    }
+
+    QwenAsrAudioEncoderOutput audio;
+    if (!qwenasr_audio_encoder_forward_ggml(
+            model,
+            features,
+            n_threads,
+            n_audio_layers,
+            n_audio_heads,
+            audio_output_dim,
+            &audio,
+            error)) {
+        return false;
+    }
+    return qwenasr_decoder_input_from_audio(
+        model,
+        tokenizer,
+        audio,
+        audio_token_id,
+        system_text,
+        language,
+        out,
+        error);
 }

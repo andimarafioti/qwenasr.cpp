@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audio-features.h"
+#include "audio-encoder.h"
 #include "gguf-model.h"
 #include "tokenizer.h"
 
@@ -24,6 +24,16 @@ bool qwenasr_decoder_input_forward_ggml(
     int n_audio_layers,
     int n_audio_heads,
     int audio_output_dim,
+    int audio_token_id,
+    const std::string & system_text,
+    const std::string & language,
+    QwenAsrDecoderInputOutput * out,
+    std::string * error);
+
+bool qwenasr_decoder_input_from_audio(
+    const QwenAsrGgufModel & model,
+    const QwenAsrTokenizer & tokenizer,
+    const QwenAsrAudioEncoderOutput & audio,
     int audio_token_id,
     const std::string & system_text,
     const std::string & language,
