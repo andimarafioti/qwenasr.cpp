@@ -79,3 +79,7 @@ qwenasr_compile_options(qwen-asr-audio-prep)
 add_executable(qwen-asr-audio-layer tools/qwen-asr-audio-layer.cpp)
 target_link_libraries(qwen-asr-audio-layer PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-audio-layer)
+
+add_executable(qwen-asr-audio-encoder tools/qwen-asr-audio-encoder.cpp)
+target_link_libraries(qwen-asr-audio-encoder PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-audio-encoder)

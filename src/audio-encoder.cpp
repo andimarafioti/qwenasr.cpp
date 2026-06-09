@@ -199,12 +199,13 @@ struct AudioLayerTensors {
     int ffn = 0;
 };
 
-static bool load_audio_layer0_tensors(
+static bool load_audio_layer_tensors(
     const QwenAsrGgufModel & model,
+    int layer,
     int hidden,
     AudioLayerTensors * tensors,
     std::string * error) {
-    const std::string prefix = "audio.blk.0.";
+    const std::string prefix = "audio.blk." + std::to_string(layer) + ".";
     if (!require_f32_tensor(model, prefix + "attn_norm.weight", &tensors->attn_norm_w, error) ||
         !require_f32_tensor(model, prefix + "attn_norm.bias", &tensors->attn_norm_b, error) ||
         !require_f32_tensor(model, prefix + "ffn_norm.weight", &tensors->ffn_norm_w, error) ||
@@ -270,7 +271,7 @@ bool qwenasr_audio_layer0_forward_cpu(
     }
 
     AudioLayerTensors tensors;
-    if (!load_audio_layer0_tensors(model, hidden, &tensors, error)) {
+    if (!load_audio_layer_tensors(model, 0, hidden, &tensors, error)) {
         return false;
     }
     const int ffn = tensors.ffn;
@@ -341,34 +342,31 @@ static ggml_tensor * layer_norm_ggml(
     return ggml_add(ctx, output, bias);
 }
 
-bool qwenasr_audio_layer0_forward_ggml(
+static bool audio_layer_forward_ggml_values(
     const QwenAsrGgufModel & model,
-    const QwenAsrFeatures & features,
+    const std::vector<float> & input_values,
+    int tokens,
+    int hidden,
     int n_threads,
     int n_heads,
-    QwenAsrAudioLayerOutput * out,
+    int layer,
+    std::vector<float> * out_values,
     std::string * error) {
-    if (!out) {
-        set_error(error, "qwenasr_audio_layer0_forward_ggml: out is null");
-        return false;
-    }
     if (n_threads <= 0) {
         n_threads = 1;
     }
-
-    QwenAsrAudioPrepOutput prep;
-    if (!qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, error)) {
+    if (!out_values) {
+        set_error(error, "audio_layer_forward_ggml_values: out_values is null");
         return false;
     }
-    const int tokens = prep.tokens;
-    const int hidden = prep.hidden;
-    if (tokens <= 0 || hidden <= 0 || n_heads <= 0 || hidden % n_heads != 0) {
+    if (tokens <= 0 || hidden <= 0 || n_heads <= 0 || hidden % n_heads != 0 ||
+        input_values.size() != static_cast<size_t>(tokens) * hidden) {
         set_error(error, "invalid audio layer geometry");
         return false;
     }
 
     AudioLayerTensors tensors;
-    if (!load_audio_layer0_tensors(model, hidden, &tensors, error)) {
+    if (!load_audio_layer_tensors(model, layer, hidden, &tensors, error)) {
         return false;
     }
 
@@ -380,12 +378,12 @@ bool qwenasr_audio_layer0_forward_ggml(
     params.no_alloc = false;
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
-        set_error(error, "failed to initialize GGML context for audio layer0");
+        set_error(error, "failed to initialize GGML context for audio layer");
         return false;
     }
 
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
-    std::memcpy(x->data, prep.values.data(), prep.values.size() * sizeof(float));
+    std::memcpy(x->data, input_values.data(), input_values.size() * sizeof(float));
 
     ggml_tensor * attn_norm_w = new_f32_tensor_from_view(ctx, tensors.attn_norm_w);
     ggml_tensor * attn_norm_b = new_f32_tensor_from_view(ctx, tensors.attn_norm_b);
@@ -441,18 +439,221 @@ bool qwenasr_audio_layer0_forward_ggml(
     const ggml_status status = ggml_graph_compute_with_ctx(ctx, graph, n_threads);
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
-        set_error(error, "GGML audio layer0 graph compute failed");
+        set_error(error, "GGML audio layer graph compute failed");
+        return false;
+    }
+
+    out_values->assign(static_cast<size_t>(tokens) * hidden, 0.0f);
+    std::memcpy(out_values->data(), ggml_get_data_f32(hidden_states), out_values->size() * sizeof(float));
+
+    ggml_free(ctx);
+    return true;
+}
+
+bool qwenasr_audio_layer0_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    int n_heads,
+    QwenAsrAudioLayerOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_audio_layer0_forward_ggml: out is null");
+        return false;
+    }
+
+    QwenAsrAudioPrepOutput prep;
+    if (!qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, error)) {
         return false;
     }
 
     QwenAsrAudioLayerOutput result;
-    result.tokens = tokens;
-    result.hidden = hidden;
+    result.tokens = prep.tokens;
+    result.hidden = prep.hidden;
     result.attention_segments = std::move(prep.attention_segments);
-    result.values.assign(static_cast<size_t>(tokens) * hidden, 0.0f);
-    std::memcpy(result.values.data(), ggml_get_data_f32(hidden_states), result.values.size() * sizeof(float));
+    if (!audio_layer_forward_ggml_values(
+            model,
+            prep.values,
+            result.tokens,
+            result.hidden,
+            n_threads,
+            n_heads,
+            0,
+            &result.values,
+            error)) {
+        return false;
+    }
 
+    *out = std::move(result);
+    return true;
+}
+
+struct AudioProjectorTensors {
+    QwenAsrGgufTensorView post_norm_w;
+    QwenAsrGgufTensorView post_norm_b;
+    QwenAsrGgufTensorView proj0_w;
+    QwenAsrGgufTensorView proj0_b;
+    QwenAsrGgufTensorView proj1_w;
+    QwenAsrGgufTensorView proj1_b;
+};
+
+static bool load_audio_projector_tensors(
+    const QwenAsrGgufModel & model,
+    int hidden,
+    int output_dim,
+    AudioProjectorTensors * tensors,
+    std::string * error) {
+    if (!require_f32_tensor(model, "audio.post_norm.weight", &tensors->post_norm_w, error) ||
+        !require_f32_tensor(model, "audio.post_norm.bias", &tensors->post_norm_b, error) ||
+        !require_f32_tensor(model, "audio.proj.0.weight", &tensors->proj0_w, error) ||
+        !require_f32_tensor(model, "audio.proj.0.bias", &tensors->proj0_b, error) ||
+        !require_f32_tensor(model, "audio.proj.1.weight", &tensors->proj1_w, error) ||
+        !require_f32_tensor(model, "audio.proj.1.bias", &tensors->proj1_b, error)) {
+        return false;
+    }
+    if (!require_shape(tensors->post_norm_w, hidden, error) ||
+        !require_shape(tensors->post_norm_b, hidden, error) ||
+        !require_shape(tensors->proj0_w, hidden, hidden, error) ||
+        !require_shape(tensors->proj0_b, hidden, error) ||
+        !require_shape(tensors->proj1_w, hidden, output_dim, error) ||
+        !require_shape(tensors->proj1_b, output_dim, error)) {
+        return false;
+    }
+    return true;
+}
+
+static bool audio_projector_forward_ggml_values(
+    const QwenAsrGgufModel & model,
+    const std::vector<float> & input_values,
+    int tokens,
+    int hidden,
+    int output_dim,
+    int n_threads,
+    std::vector<float> * out_values,
+    std::string * error) {
+    if (!out_values) {
+        set_error(error, "audio_projector_forward_ggml_values: out_values is null");
+        return false;
+    }
+    if (tokens <= 0 || hidden <= 0 || output_dim <= 0 ||
+        input_values.size() != static_cast<size_t>(tokens) * hidden) {
+        set_error(error, "invalid audio projector geometry");
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = 1;
+    }
+
+    AudioProjectorTensors tensors;
+    if (!load_audio_projector_tensors(model, hidden, output_dim, &tensors, error)) {
+        return false;
+    }
+
+    const size_t ctx_size = 512ull * 1024ull * 1024ull;
+    std::vector<uint8_t> ctx_buffer(ctx_size);
+    ggml_init_params params;
+    params.mem_size = ctx_buffer.size();
+    params.mem_buffer = ctx_buffer.data();
+    params.no_alloc = false;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize GGML context for audio projector");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, tokens);
+    std::memcpy(x->data, input_values.data(), input_values.size() * sizeof(float));
+
+    ggml_tensor * post_norm_w = new_f32_tensor_from_view(ctx, tensors.post_norm_w);
+    ggml_tensor * post_norm_b = new_f32_tensor_from_view(ctx, tensors.post_norm_b);
+    ggml_tensor * proj0_w = new_f32_tensor_from_view(ctx, tensors.proj0_w);
+    ggml_tensor * proj0_b = new_f32_tensor_from_view(ctx, tensors.proj0_b);
+    ggml_tensor * proj1_w = new_f32_tensor_from_view(ctx, tensors.proj1_w);
+    ggml_tensor * proj1_b = new_f32_tensor_from_view(ctx, tensors.proj1_b);
+
+    ggml_tensor * y = layer_norm_ggml(ctx, x, post_norm_w, post_norm_b);
+    y = linear_ggml(ctx, y, proj0_w, proj0_b);
+    y = ggml_gelu_erf(ctx, y);
+    y = linear_ggml(ctx, y, proj1_w, proj1_b);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    const ggml_status status = ggml_graph_compute_with_ctx(ctx, graph, n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        set_error(error, "GGML audio projector graph compute failed");
+        return false;
+    }
+
+    out_values->assign(static_cast<size_t>(tokens) * output_dim, 0.0f);
+    std::memcpy(out_values->data(), ggml_get_data_f32(y), out_values->size() * sizeof(float));
     ggml_free(ctx);
+    return true;
+}
+
+bool qwenasr_audio_encoder_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    int n_layers,
+    int n_heads,
+    int output_dim,
+    QwenAsrAudioEncoderOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_audio_encoder_forward_ggml: out is null");
+        return false;
+    }
+    if (n_layers <= 0 || output_dim <= 0) {
+        set_error(error, "invalid audio encoder configuration");
+        return false;
+    }
+
+    QwenAsrAudioPrepOutput prep;
+    if (!qwenasr_audio_prep_forward_ggml(model, features, n_threads, &prep, error)) {
+        return false;
+    }
+    if (prep.tokens <= 0 || prep.hidden <= 0 || n_heads <= 0 || prep.hidden % n_heads != 0) {
+        set_error(error, "invalid audio encoder geometry");
+        return false;
+    }
+
+    std::vector<float> hidden_states = std::move(prep.values);
+    std::vector<float> next;
+    for (int layer = 0; layer < n_layers; ++layer) {
+        if (!audio_layer_forward_ggml_values(
+                model,
+                hidden_states,
+                prep.tokens,
+                prep.hidden,
+                n_threads,
+                n_heads,
+                layer,
+                &next,
+                error)) {
+            return false;
+        }
+        hidden_states.swap(next);
+    }
+
+    std::vector<float> projected;
+    if (!audio_projector_forward_ggml_values(
+            model,
+            hidden_states,
+            prep.tokens,
+            prep.hidden,
+            output_dim,
+            n_threads,
+            &projected,
+            error)) {
+        return false;
+    }
+
+    QwenAsrAudioEncoderOutput result;
+    result.tokens = prep.tokens;
+    result.hidden = output_dim;
+    result.attention_segments = std::move(prep.attention_segments);
+    result.values = std::move(projected);
     *out = std::move(result);
     return true;
 }
