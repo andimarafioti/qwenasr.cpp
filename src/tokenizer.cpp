@@ -7,6 +7,7 @@
 #include <climits>
 #include <cctype>
 #include <cstddef>
+#include <unordered_map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -476,6 +477,53 @@ std::vector<int32_t> qwenasr_tokenizer_encode(
         ids.push_back(tokenizer.eos_token);
     }
     return ids;
+}
+
+std::string qwenasr_tokenizer_decode(
+    const QwenAsrTokenizer & tokenizer,
+    const std::vector<int32_t> & ids,
+    bool skip_special) {
+    std::unordered_map<std::string, char> byte_decoder;
+    byte_decoder.reserve(256);
+    for (int i = 0; i < 256; ++i) {
+        byte_decoder[tokenizer.byte_encoder[i]] = static_cast<char>(i);
+    }
+
+    std::vector<bool> special_ids(tokenizer.id_to_token.size(), false);
+    if (skip_special) {
+        for (const auto & item : tokenizer.specials) {
+            if (item.second >= 0 && static_cast<size_t>(item.second) < special_ids.size()) {
+                special_ids[static_cast<size_t>(item.second)] = true;
+            }
+        }
+    }
+
+    std::string out;
+    for (const int32_t id : ids) {
+        if (id < 0 || static_cast<size_t>(id) >= tokenizer.id_to_token.size()) {
+            continue;
+        }
+        if (skip_special && special_ids[static_cast<size_t>(id)]) {
+            continue;
+        }
+        const std::string & token = tokenizer.id_to_token[static_cast<size_t>(id)];
+        const char * s = token.c_str();
+        const int len = static_cast<int>(token.size());
+        int pos = 0;
+        while (pos < len) {
+            int adv = 0;
+            utf8_codepoint(s + pos, &adv);
+            const std::string piece(s + pos, static_cast<size_t>(adv));
+            const auto it = byte_decoder.find(piece);
+            if (it != byte_decoder.end()) {
+                out.push_back(it->second);
+            } else {
+                out += piece;
+            }
+            pos += adv;
+        }
+    }
+    return out;
 }
 
 std::string qwenasr_build_asr_prompt(

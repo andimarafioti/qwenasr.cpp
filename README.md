@@ -235,16 +235,20 @@ as `qwen-asr-text-layer`. It builds the decoder input embeddings, then runs
 scalar CPU Qwen3 blocks with RMSNorm, Q/K/V projection, per-head Q/K RMSNorm,
 RoPE, grouped-query causal attention, output projection, and SwiGLU MLP.
 `--prefill` runs every text block plus the output RMSNorm and LM head, returning
-the next-token logits from the final prompt position. This is a correctness
-boundary for the future native decoder/KV-cache path; it is not yet the full
-autoregressive decoder:
+the next-token logits from the final prompt position. `--generate N` adds a
+minimal greedy loop that decodes generated token ids back to text, currently by
+recomputing the full text prefill after each appended token. This is a
+correctness boundary for the future native decoder/KV-cache path; it is not yet
+the fast autoregressive decoder:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --out text-layer0-sched.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --prefill --out next-token-logits.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --out native-prefix.txt
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
 python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
 ```
 
 ## Streaming
@@ -281,6 +285,7 @@ python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --torch-device cpu
+python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 1 --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -379,6 +384,15 @@ all decoder layers and the LM head in native C++, but also makes the next
 optimization target concrete: reusable GGML/backend text graphs and a KV-cache
 decode loop.
 
+For the minimal recompute greedy generation loop, `benchmarks/check_text_generate.py`
+matches the Torch reference for the first two JFK English tokens (`3036,773`,
+decoded as `And so`). `benchmarks/bench_text_generate.py --max-new-tokens 1`
+measured roughly 34.7-35.2 s for scalar C++ generation with 8 CPU threads,
+525 ms for Torch CPU FP32 with 8 threads, and 40.0 ms for Torch CUDA BF16.
+This is now an end-to-end native audio-to-token/text path for generated output,
+but it intentionally highlights the remaining qwentts.cpp-style work: KV-cache
+single-token decoding and persistent backend text graphs.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -406,6 +420,7 @@ normalization, the audio projector, decoder input embedding assembly, and a
 qwentts.cpp-style scheduled backend for the audio CNN, transformer, and
 projector that is also wired through decoder input assembly. The Qwen3 text
 decoder is validated as a scalar CPU path through the first block and full
-prompt prefill logits, including final normalization and the LM head.
+prompt prefill logits, including final normalization and the LM head, plus a
+minimal recompute greedy generation loop with byte-level BPE decode.
 The remaining native work is to port the Qwen3 decoder/KV cache and extend the
 persistent backend path through the remaining standalone frontend tools.

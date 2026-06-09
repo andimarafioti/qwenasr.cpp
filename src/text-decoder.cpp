@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -454,6 +455,112 @@ bool qwenasr_text_prefill_forward_cpu(
     result.hidden = input.hidden;
     result.vocab = vocab;
     result.logits = std::move(logits);
+    *out = std::move(result);
+    return true;
+}
+
+bool qwenasr_text_generate_greedy_cpu(
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int max_new_tokens,
+    int n_layers,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    float rope_theta,
+    float rms_norm_eps,
+    const std::vector<int32_t> & stop_ids,
+    QwenAsrTextGenerateOutput * out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_generate_greedy_cpu: out is null");
+        return false;
+    }
+    if (max_new_tokens < 0) {
+        set_error(error, "max_new_tokens must be non-negative");
+        return false;
+    }
+    if (input.tokens <= 0 || input.hidden <= 0 ||
+        input.values.size() != static_cast<size_t>(input.tokens) * input.hidden) {
+        set_error(error, "invalid text generation input");
+        return false;
+    }
+
+    QwenAsrGgufTensorView embd;
+    if (!require_f32_tensor(model, "text.token_embd.weight", &embd, error)) {
+        return false;
+    }
+    if (!require_shape(embd, input.hidden, vocab, error)) {
+        return false;
+    }
+    const float * embedding = tensor_f32(embd);
+
+    QwenAsrDecoderInputOutput state = input;
+    QwenAsrTextGenerateOutput result;
+    result.prompt_tokens = input.tokens;
+    result.total_tokens = input.tokens;
+    result.hidden = input.hidden;
+    result.vocab = vocab;
+    result.generated_ids.reserve(static_cast<size_t>(max_new_tokens));
+
+    for (int step = 0; step < max_new_tokens; ++step) {
+        QwenAsrTextPrefillOutput prefill;
+        if (!qwenasr_text_prefill_forward_cpu(
+                model,
+                state,
+                n_layers,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                intermediate,
+                vocab,
+                rope_theta,
+                rms_norm_eps,
+                &prefill,
+                error)) {
+            return false;
+        }
+
+        int32_t next_id = -1;
+        float best = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < prefill.vocab; ++i) {
+            const float value = prefill.logits[static_cast<size_t>(i)];
+            if (value > best) {
+                best = value;
+                next_id = static_cast<int32_t>(i);
+            }
+        }
+        if (next_id < 0 || next_id >= vocab) {
+            set_error(error, "generated token id is out of range");
+            return false;
+        }
+
+        result.generated_ids.push_back(next_id);
+        result.total_tokens = input.tokens + static_cast<int>(result.generated_ids.size());
+        bool stop = false;
+        for (const int32_t stop_id : stop_ids) {
+            if (next_id == stop_id) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            result.stopped = true;
+            break;
+        }
+
+        const size_t old_values = state.values.size();
+        state.input_ids.push_back(next_id);
+        state.values.resize(old_values + static_cast<size_t>(state.hidden));
+        std::memcpy(
+            state.values.data() + old_values,
+            embedding + static_cast<size_t>(next_id) * state.hidden,
+            static_cast<size_t>(state.hidden) * sizeof(float));
+        ++state.tokens;
+    }
+
     *out = std::move(result);
     return true;
 }

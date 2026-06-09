@@ -24,6 +24,11 @@ std::vector<int32_t> qwenasr_tokenizer_encode(
     const std::string & text,
     bool add_eos = false);
 
+std::string qwenasr_tokenizer_decode(
+    const QwenAsrTokenizer & tokenizer,
+    const std::vector<int32_t> & ids,
+    bool skip_special = true);
+
 std::string qwenasr_build_asr_prompt(
     int audio_tokens,
     const std::string & system_text = "",

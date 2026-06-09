@@ -21,8 +21,9 @@ static void usage(const char * argv0) {
         << "       " << argv0 << " model.gguf audio.wav [--language NAME] [--system TEXT]\n"
         << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched] [--layer N]\n"
         << "       " << argv0 << " model.gguf audio.wav --prefill [--out next-token-logits.f32]\n"
+        << "       " << argv0 << " model.gguf audio.wav --generate N\n"
         << "\n"
-        << "Run native Qwen3-ASR decoder input assembly plus one text layer, or full text prefill.\n";
+        << "Run native Qwen3-ASR decoder input assembly, text prefill, or slow greedy generation.\n";
 }
 
 static bool write_raw(const std::string & path, const std::vector<float> & values, std::string * error) {
@@ -43,6 +44,51 @@ static bool write_raw(const std::string & path, const std::vector<float> & value
     return true;
 }
 
+static bool write_text(const std::string & path, const std::string & value, std::string * error) {
+    std::ofstream out(path);
+    if (!out) {
+        if (error) {
+            *error = "failed to open output file: " + path;
+        }
+        return false;
+    }
+    out << value;
+    if (!out) {
+        if (error) {
+            *error = "failed to write output file: " + path;
+        }
+        return false;
+    }
+    return true;
+}
+
+static std::string json_escape(const std::string & value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (const unsigned char c : value) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '"': out += "\\\""; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                const char hex[] = "0123456789abcdef";
+                out += "\\u00";
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 0x0F]);
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
         usage(argv[0]);
@@ -59,6 +105,7 @@ int main(int argc, char ** argv) {
     std::string system_text;
     std::string audio_backend = "sched";
     bool prefill = false;
+    int generate_tokens = -1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -67,6 +114,20 @@ int main(int argc, char ** argv) {
         }
         if (arg == "--prefill") {
             prefill = true;
+            continue;
+        }
+        if (arg == "--generate") {
+            if (++i >= argc) {
+                std::cerr << "--generate requires a non-negative integer\n";
+                return 2;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(argv[i], &end, 10);
+            if (!end || *end != '\0' || parsed < 0 || parsed > 1024) {
+                std::cerr << "--generate requires a non-negative integer up to 1024\n";
+                return 2;
+            }
+            generate_tokens = static_cast<int>(parsed);
             continue;
         }
         if (arg == "--out") {
@@ -147,6 +208,10 @@ int main(int argc, char ** argv) {
 
     if (model_path.empty() || audio_path.empty()) {
         std::cerr << "model GGUF and audio WAV are required\n";
+        return 2;
+    }
+    if (prefill && generate_tokens >= 0) {
+        std::cerr << "--prefill and --generate are mutually exclusive\n";
         return 2;
     }
 
@@ -259,6 +324,75 @@ int main(int argc, char ** argv) {
         qwenasr_gguf_model_close(&model);
         std::cerr << error << "\n";
         return 1;
+    }
+
+    if (generate_tokens >= 0) {
+        QwenAsrTextGenerateOutput generated;
+        const auto generate_start = std::chrono::steady_clock::now();
+        const std::vector<int32_t> stop_ids = {
+            static_cast<int32_t>(cfg.token_im_end),
+            static_cast<int32_t>(cfg.token_endoftext),
+            static_cast<int32_t>(cfg.tokenizer_eos),
+        };
+        const bool generate_ok = qwenasr_text_generate_greedy_cpu(
+            model,
+            decoder_input,
+            generate_tokens,
+            static_cast<int>(cfg.text_num_hidden_layers),
+            static_cast<int>(cfg.text_num_attention_heads),
+            static_cast<int>(cfg.text_num_key_value_heads),
+            static_cast<int>(cfg.text_head_dim),
+            static_cast<int>(cfg.text_intermediate_size),
+            static_cast<int>(cfg.text_vocab_size),
+            cfg.text_rope_theta,
+            cfg.text_rms_norm_eps,
+            stop_ids,
+            &generated,
+            &error);
+        const auto generate_end = std::chrono::steady_clock::now();
+        qwenasr_gguf_model_close(&model);
+        if (!generate_ok) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        const std::string generated_text = qwenasr_tokenizer_decode(tokenizer, generated.generated_ids, true);
+        if (!out_path.empty() && !write_text(out_path, generated_text, &error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+
+        const double decoder_input_ms = std::chrono::duration<double, std::milli>(decoder_end - decoder_start).count();
+        const double generate_ms = std::chrono::duration<double, std::milli>(generate_end - generate_start).count();
+
+        std::cout << "backend=cpu\n";
+        std::cout << "mode=generate\n";
+        std::cout << "audio_backend=" << audio_backend << "\n";
+        std::cout << "threads=" << n_threads << "\n";
+        std::cout << "init_ms=" << init_ms << "\n";
+        std::cout << "decoder_input_ms=" << decoder_input_ms << "\n";
+        std::cout << "generate_ms=" << generate_ms << "\n";
+        std::cout << "sample_rate=" << sample_rate << "\n";
+        std::cout << "samples=" << samples.size() << "\n";
+        std::cout << "feature_frames=" << features.n_frames << "\n";
+        std::cout << "layers=" << cfg.text_num_hidden_layers << "\n";
+        std::cout << "prompt_tokens=" << generated.prompt_tokens << "\n";
+        std::cout << "total_tokens=" << generated.total_tokens << "\n";
+        std::cout << "hidden=" << generated.hidden << "\n";
+        std::cout << "vocab=" << generated.vocab << "\n";
+        std::cout << "requested_tokens=" << generate_tokens << "\n";
+        std::cout << "generated_tokens=" << generated.generated_ids.size() << "\n";
+        std::cout << "stopped=" << (generated.stopped ? "true" : "false") << "\n";
+        std::cout << "generated_ids=";
+        for (size_t i = 0; i < generated.generated_ids.size(); ++i) {
+            if (i > 0) {
+                std::cout << ",";
+            }
+            std::cout << generated.generated_ids[i];
+        }
+        std::cout << "\n";
+        std::cout << "text_json=" << json_escape(generated_text) << "\n";
+        return 0;
     }
 
     if (prefill) {
