@@ -32,6 +32,7 @@ qwenasr_compile_options(qwenasr_bridge)
 add_library(qwenasr_native STATIC
     src/native-model.cpp
     src/audio-features.cpp
+    src/tokenizer.cpp
 )
 target_include_directories(qwenasr_native PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -51,3 +52,7 @@ qwenasr_compile_options(qwen-asr-gguf-info)
 add_executable(qwen-asr-features tools/qwen-asr-features.cpp)
 target_link_libraries(qwen-asr-features PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-features)
+
+add_executable(qwen-asr-tokenize tools/qwen-asr-tokenize.cpp)
+target_link_libraries(qwen-asr-tokenize PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-tokenize)

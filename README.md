@@ -124,6 +124,15 @@ The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
 ./build/qwen-asr-gguf-info qwen3-asr-0.6b-f32.gguf
 ```
 
+The native tokenizer loader is available as `qwen-asr-tokenize`. It reads the
+qwentts-style `tokenizer.ggml.*` GGUF metadata, expands the ASR audio prompt,
+and can be checked against the HF tokenizer:
+
+```bash
+./build/qwen-asr-tokenize qwen3-asr-0.6b-meta.gguf --audio-tokens 143 --language English
+python benchmarks/check_tokenizer.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-meta.gguf --audio-tokens 143 --language English
+```
+
 The native audio frontend is available as `qwen-asr-features`. It currently
 supports 16 kHz WAV input and matches the HF `WhisperFeatureExtractor` path used
 by Qwen3-ASR:
@@ -207,7 +216,8 @@ a lean native/Torch fast path that avoids the official transformers backend's
 per-sample audio encoder loop and adds a captured single-stream decoder path.
 
 The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
-CLI tool, future GGUF conversion, and a GGML runtime. The bridge currently
-validates the C++ surface and comparison harness; the remaining native work is
-to port the Whisper log-mel frontend, ASR audio tower/projector, Qwen tokenizer
-prompt expansion, and Qwen3 decoder/KV cache into GGML.
+CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
+the C++ surface and comparison harness, and the native path now covers GGUF
+metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
+BPE prompt expansion. The remaining native work is to port the ASR audio
+tower/projector and Qwen3 decoder/KV cache into GGML.
