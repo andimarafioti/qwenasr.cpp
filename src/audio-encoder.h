@@ -21,3 +21,11 @@ bool qwenasr_audio_layer0_forward_cpu(
     int n_heads,
     QwenAsrAudioLayerOutput * out,
     std::string * error);
+
+bool qwenasr_audio_layer0_forward_ggml(
+    const QwenAsrGgufModel & model,
+    const QwenAsrFeatures & features,
+    int n_threads,
+    int n_heads,
+    QwenAsrAudioLayerOutput * out,
+    std::string * error);

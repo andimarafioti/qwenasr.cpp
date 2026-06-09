@@ -44,7 +44,7 @@ def _torch_dtype(name: str) -> torch.dtype:
     raise ValueError(f"unsupported dtype: {name}")
 
 
-def _bench_cpp(layer_bin: Path, gguf: Path, audio: Path, threads: int, repeat: int) -> list[float]:
+def _bench_cpp(layer_bin: Path, gguf: Path, audio: Path, threads: int, repeat: int, backend: str) -> list[float]:
     times = []
     for _ in range(repeat):
         meta = _parse_kv(
@@ -55,6 +55,8 @@ def _bench_cpp(layer_bin: Path, gguf: Path, audio: Path, threads: int, repeat: i
                     str(audio),
                     "--threads",
                     str(threads),
+                    "--backend",
+                    backend,
                 ]
             )
         )
@@ -158,6 +160,7 @@ def main() -> int:
     parser.add_argument("--cpp-bin", default=str(ROOT / "build" / "qwen-asr-audio-layer"))
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--cpp-backend", choices=("ggml", "cpu"), default="ggml")
     parser.add_argument("--heads", type=int, default=14)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
@@ -192,7 +195,7 @@ def main() -> int:
         for name, tensor in LAYER0_TENSORS.items()
     }
 
-    cpp_times = _bench_cpp(layer_bin, args.gguf, args.audio, args.threads, args.repeat)
+    cpp_times = _bench_cpp(layer_bin, args.gguf, args.audio, args.threads, args.repeat, args.cpp_backend)
     torch_times = _bench_torch(
         chunks,
         chunk_input_lengths,
@@ -212,10 +215,11 @@ def main() -> int:
     print(f"shape=({tokens}, {weights['attn_norm_weight'].shape[0]})")
     print(f"threads={args.threads}")
     print(f"heads={args.heads}")
+    print(f"cpp_backend={args.cpp_backend}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    print(f"cpp_cpu_best_ms={cpp_best:.3f}")
-    print(f"cpp_cpu_mean_ms={cpp_mean:.3f}")
+    print(f"cpp_{args.cpp_backend}_best_ms={cpp_best:.3f}")
+    print(f"cpp_{args.cpp_backend}_mean_ms={cpp_mean:.3f}")
     print(f"torch_best_ms={torch_best:.3f}")
     print(f"torch_mean_ms={torch_mean:.3f}")
     print("status=ok")

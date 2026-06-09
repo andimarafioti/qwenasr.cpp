@@ -15,7 +15,7 @@
 
 static void usage(const char * argv0) {
     std::cerr
-        << "Usage: " << argv0 << " model.gguf audio.wav [--out layer0.f32] [--threads N]\n"
+        << "Usage: " << argv0 << " model.gguf audio.wav [--out layer0.f32] [--threads N] [--backend ggml|cpu]\n"
         << "\n"
         << "Run native Qwen3-ASR audio prep plus encoder layer 0.\n";
 }
@@ -46,6 +46,7 @@ int main(int argc, char ** argv) {
 
     const unsigned hw_threads = std::thread::hardware_concurrency();
     int n_threads = hw_threads == 0 ? 1 : static_cast<int>(hw_threads);
+    std::string backend = "ggml";
     std::string model_path;
     std::string audio_path;
     std::string out_path;
@@ -75,6 +76,18 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             n_threads = static_cast<int>(parsed);
+            continue;
+        }
+        if (arg == "--backend") {
+            if (++i >= argc) {
+                std::cerr << "--backend requires ggml or cpu\n";
+                return 2;
+            }
+            backend = argv[i];
+            if (backend != "ggml" && backend != "cpu") {
+                std::cerr << "--backend requires ggml or cpu\n";
+                return 2;
+            }
             continue;
         }
         if (model_path.empty()) {
@@ -121,13 +134,24 @@ int main(int argc, char ** argv) {
 
     QwenAsrAudioLayerOutput layer;
     const auto layer_start = std::chrono::steady_clock::now();
-    const bool layer_ok = qwenasr_audio_layer0_forward_cpu(
-        model,
-        features,
-        n_threads,
-        static_cast<int>(cfg.audio_encoder_attention_heads),
-        &layer,
-        &error);
+    bool layer_ok = false;
+    if (backend == "ggml") {
+        layer_ok = qwenasr_audio_layer0_forward_ggml(
+            model,
+            features,
+            n_threads,
+            static_cast<int>(cfg.audio_encoder_attention_heads),
+            &layer,
+            &error);
+    } else {
+        layer_ok = qwenasr_audio_layer0_forward_cpu(
+            model,
+            features,
+            n_threads,
+            static_cast<int>(cfg.audio_encoder_attention_heads),
+            &layer,
+            &error);
+    }
     const auto layer_end = std::chrono::steady_clock::now();
     qwenasr_gguf_model_close(&model);
     if (!layer_ok) {
@@ -152,7 +176,7 @@ int main(int argc, char ** argv) {
     const double layer_ms =
         std::chrono::duration<double, std::milli>(layer_end - layer_start).count();
 
-    std::cout << "backend=cpu\n";
+    std::cout << "backend=" << backend << "\n";
     std::cout << "threads=" << n_threads << "\n";
     std::cout << "layer_ms=" << layer_ms << "\n";
     std::cout << "sample_rate=" << sample_rate << "\n";
