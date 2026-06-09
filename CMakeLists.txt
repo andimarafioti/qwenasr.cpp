@@ -36,6 +36,7 @@ add_library(qwenasr_native STATIC
     src/audio-conv.cpp
     src/audio-encoder.cpp
     src/decoder-input.cpp
+    src/text-decoder.cpp
     src/tokenizer.cpp
 )
 target_include_directories(qwenasr_native PUBLIC
@@ -88,3 +89,7 @@ qwenasr_compile_options(qwen-asr-audio-encoder)
 add_executable(qwen-asr-decoder-input tools/qwen-asr-decoder-input.cpp)
 target_link_libraries(qwen-asr-decoder-input PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-decoder-input)
+
+add_executable(qwen-asr-text-layer tools/qwen-asr-text-layer.cpp)
+target_link_libraries(qwen-asr-text-layer PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-text-layer)
