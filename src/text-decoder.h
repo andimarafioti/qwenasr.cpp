@@ -95,6 +95,22 @@ bool qwenasr_text_decoder_backend_init(
     QwenAsrTextDecoderBackend ** out,
     std::string * error);
 
+bool qwenasr_text_decoder_backend_init_cached(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    int max_seq_len,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextDecoderBackend ** out,
+    std::string * error);
+
 void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend);
 
 bool qwenasr_text_prefill_backend_forward(
@@ -129,6 +145,15 @@ bool qwenasr_text_generate_greedy_cpu(
     int vocab,
     float rope_theta,
     float rms_norm_eps,
+    const std::vector<int32_t> & stop_ids,
+    QwenAsrTextGenerateOutput * out,
+    std::string * error);
+
+bool qwenasr_text_generate_cached_backend(
+    QwenAsrTextDecoderBackend * backend,
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int max_new_tokens,
     const std::vector<int32_t> & stop_ids,
     QwenAsrTextGenerateOutput * out,
     std::string * error);

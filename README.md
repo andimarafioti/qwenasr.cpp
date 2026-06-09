@@ -240,9 +240,10 @@ weights into a GGML CPU backend buffer once. `--prefill` runs every text block
 plus the output RMSNorm and LM head, returning the next-token logits from the
 final prompt position; it supports the scalar text path and `--backend sched`.
 `--generate N` adds a minimal greedy loop that decodes generated token ids back
-to text; `--kv-cache` keeps scalar per-layer K/V tensors from prompt prefill and
-runs following tokens through a one-row cached decode. Generation is still a
-scalar text path, so this is not yet the fast GGML autoregressive decoder:
+to text; `--kv-cache` keeps per-layer K/V tensors from prompt prefill and runs
+following tokens through a one-row cached decode. It supports the scalar path
+and `--backend sched`, where the K/V cache is stored in backend tensors and each
+step appends through GGML graph-side cache writes:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
@@ -253,6 +254,7 @@ scalar text path, so this is not yet the fast GGML autoregressive decoder:
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --backend sched --prefill --out next-token-logits-sched.f32
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --out native-prefix.txt
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --kv-cache --out native-prefix-cache.txt
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --backend sched --generate 2 --kv-cache --out native-prefix-sched.txt
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend ggml
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend sched
@@ -260,6 +262,7 @@ python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-a
 python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --native-backend sched
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
 python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-decode-backend kv-cache
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-backend sched --native-decode-backend kv-cache
 ```
 
 ## Streaming
@@ -296,7 +299,7 @@ python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-
 python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --cpp-backends scalar ggml sched --torch-device cpu
 python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --cpp-backends scalar sched --torch-device cpu
-python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-decode-backends kv-cache --torch-device cpu
+python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-backends scalar sched --cpp-decode-backends kv-cache --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -400,13 +403,14 @@ scheduled KV-cache single-token decode loop.
 
 For greedy generation, `benchmarks/check_text_generate.py` matches the Torch
 reference for the first four JFK English tokens (`3036,773,11,847`, decoded as
-`And so, my`) with the scalar KV-cache native path. The original recompute path
-took about 69.3 s for just two tokens. With `--kv-cache`, a four-token run
-measured about 35.8 s with 8 CPU threads, compared with 3.20 s for Torch CPU
-FP32 with 8 threads. This is now an end-to-end native audio-to-token/text path
-with cached scalar decode after prompt prefill, but it still highlights the
-remaining qwentts.cpp-style work: persistent GGML/backend text graphs and a fast
-KV-cache single-token decode loop.
+`And so, my`) with both the scalar and scheduled KV-cache native paths. The
+original recompute path took about 69.3 s for just two tokens. With scalar
+`--kv-cache`, a four-token run measured about 35.8 s with 8 CPU threads. With
+`--backend sched --kv-cache`, the same four-token run measured 585 ms after a
+742 ms one-time text weight/KV-cache initialization, compared with 1.98 s for
+Torch CPU FP32 with 8 threads. This is now an end-to-end qwentts.cpp-style
+native audio-to-token/text path with scheduled GGML prompt prefill and
+single-token KV-cache decode.
 
 ## Implementation Notes
 
@@ -436,8 +440,9 @@ qwentts.cpp-style scheduled backend for the audio CNN, transformer, and
 projector that is also wired through decoder input assembly. The Qwen3 text
 decoder is validated as a scalar CPU path through the first block and full
 prompt prefill logits, including final normalization and the LM head, plus a
-minimal greedy generation loop with byte-level BPE decode and scalar KV-cache
-support for follow-up tokens.
-The remaining native work is to move the Qwen3 decoder/KV-cache path into
-persistent GGML/backend graphs and extend that backend path through the
+minimal greedy generation loop with byte-level BPE decode. The decoder also has
+qwentts.cpp-style scheduled GGML/backend graphs for one-layer checks, full
+prompt prefill logits, and KV-cache follow-up token decoding.
+The remaining native work is to reuse the scheduled text backend across a
+longer-lived transcription API and extend that backend path through the
 remaining standalone frontend tools.

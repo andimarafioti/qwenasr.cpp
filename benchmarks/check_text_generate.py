@@ -18,6 +18,7 @@ def _dump_native_generate(
     gguf: Path,
     audio: Path,
     n_threads: int,
+    native_backend: str,
     audio_backend: str,
     decode_backend: str,
     max_new_tokens: int,
@@ -30,6 +31,8 @@ def _dump_native_generate(
         str(audio),
         "--threads",
         str(n_threads),
+        "--backend",
+        native_backend,
         "--audio-backend",
         audio_backend,
         "--generate",
@@ -119,6 +122,7 @@ def main() -> int:
     parser.add_argument("--cpp-bin", default=str(ROOT / "build" / "qwen-asr-text-layer"))
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--native-backend", choices=("scalar", "sched"), default="scalar")
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
     parser.add_argument("--native-decode-backend", choices=("recompute", "kv-cache"), default="recompute")
     parser.add_argument("--max-new-tokens", type=int, default=1)
@@ -132,12 +136,15 @@ def main() -> int:
         raise SystemExit(f"C++ text-layer binary not found: {text_bin}")
     if not features_bin.is_file():
         raise SystemExit(f"C++ feature binary not found: {features_bin}")
+    if args.native_backend == "sched" and args.native_decode_backend != "kv-cache":
+        raise SystemExit("--native-backend sched requires --native-decode-backend kv-cache")
 
     native_ids, native_text, meta = _dump_native_generate(
         text_bin,
         args.gguf,
         args.audio,
         args.threads,
+        args.native_backend,
         args.audio_backend,
         args.native_decode_backend,
         args.max_new_tokens,
@@ -161,7 +168,9 @@ def main() -> int:
     print(f"native_text_json={json.dumps(native_text)}")
     print(f"torch_text_json={json.dumps(torch_text)}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
+    print(f"native_text_init_ms={float(meta.get('text_init_ms', 0.0)):.3f}")
     print(f"native_generate_ms={float(meta['generate_ms']):.3f}")
+    print(f"native_backend={meta['backend']}")
     print(f"native_decode_backend={meta['decode_backend']}")
     print(f"native_stopped={meta['stopped']}")
     if native_ids != torch_ids:

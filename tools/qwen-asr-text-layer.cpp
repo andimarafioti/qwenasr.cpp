@@ -236,8 +236,12 @@ int main(int argc, char ** argv) {
         std::cerr << "--kv-cache requires --generate\n";
         return 2;
     }
-    if (generate_tokens >= 0 && text_backend != "scalar") {
-        std::cerr << "--backend ggml/sched currently does not support generation\n";
+    if (generate_tokens >= 0 && text_backend == "ggml") {
+        std::cerr << "--backend ggml currently supports layer mode only\n";
+        return 2;
+    }
+    if (generate_tokens >= 0 && text_backend == "sched" && !use_kv_cache) {
+        std::cerr << "--backend sched generation requires --kv-cache\n";
         return 2;
     }
     if (prefill && text_backend == "ggml") {
@@ -358,13 +362,50 @@ int main(int argc, char ** argv) {
 
     if (generate_tokens >= 0) {
         QwenAsrTextGenerateOutput generated;
-        const auto generate_start = std::chrono::steady_clock::now();
         const std::vector<int32_t> stop_ids = {
             static_cast<int32_t>(cfg.token_im_end),
             static_cast<int32_t>(cfg.token_endoftext),
             static_cast<int32_t>(cfg.tokenizer_eos),
         };
-        const bool generate_ok = use_kv_cache ?
+        double text_init_ms = 0.0;
+        QwenAsrTextDecoderBackend * text_decoder_backend = nullptr;
+        if (text_backend == "sched") {
+            const auto text_init_start = std::chrono::steady_clock::now();
+            const bool init_ok = qwenasr_text_decoder_backend_init_cached(
+                model,
+                n_threads,
+                static_cast<int>(cfg.text_num_hidden_layers),
+                decoder_input.hidden,
+                static_cast<int>(cfg.text_num_attention_heads),
+                static_cast<int>(cfg.text_num_key_value_heads),
+                static_cast<int>(cfg.text_head_dim),
+                static_cast<int>(cfg.text_intermediate_size),
+                static_cast<int>(cfg.text_vocab_size),
+                decoder_input.tokens + generate_tokens,
+                cfg.text_rope_theta,
+                cfg.text_rms_norm_eps,
+                &text_decoder_backend,
+                &error);
+            const auto text_init_end = std::chrono::steady_clock::now();
+            text_init_ms = std::chrono::duration<double, std::milli>(text_init_end - text_init_start).count();
+            if (!init_ok) {
+                qwenasr_gguf_model_close(&model);
+                std::cerr << error << "\n";
+                return 1;
+            }
+        }
+
+        const auto generate_start = std::chrono::steady_clock::now();
+        const bool generate_ok = text_backend == "sched" ?
+            qwenasr_text_generate_cached_backend(
+                text_decoder_backend,
+                model,
+                decoder_input,
+                generate_tokens,
+                stop_ids,
+                &generated,
+                &error) :
+            use_kv_cache ?
             qwenasr_text_generate_cached_cpu(
                 model,
                 decoder_input,
@@ -396,6 +437,7 @@ int main(int argc, char ** argv) {
                 &generated,
                 &error);
         const auto generate_end = std::chrono::steady_clock::now();
+        qwenasr_text_decoder_backend_free(text_decoder_backend);
         qwenasr_gguf_model_close(&model);
         if (!generate_ok) {
             std::cerr << error << "\n";
@@ -411,12 +453,13 @@ int main(int argc, char ** argv) {
         const double decoder_input_ms = std::chrono::duration<double, std::milli>(decoder_end - decoder_start).count();
         const double generate_ms = std::chrono::duration<double, std::milli>(generate_end - generate_start).count();
 
-        std::cout << "backend=scalar\n";
+        std::cout << "backend=" << text_backend << "\n";
         std::cout << "mode=generate\n";
         std::cout << "decode_backend=" << (use_kv_cache ? "kv-cache" : "recompute") << "\n";
         std::cout << "audio_backend=" << audio_backend << "\n";
         std::cout << "threads=" << n_threads << "\n";
         std::cout << "init_ms=" << init_ms << "\n";
+        std::cout << "text_init_ms=" << text_init_ms << "\n";
         std::cout << "decoder_input_ms=" << decoder_input_ms << "\n";
         std::cout << "generate_ms=" << generate_ms << "\n";
         std::cout << "sample_rate=" << sample_rate << "\n";

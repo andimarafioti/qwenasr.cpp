@@ -167,7 +167,11 @@ struct QwenAsrTextDecoderBackend {
     ggml_backend_sched_t sched = nullptr;
     ggml_context * weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buffer = nullptr;
+    ggml_context * kv_ctx = nullptr;
+    ggml_backend_buffer_t kv_buffer = nullptr;
     std::vector<BackendTextLayerTensors> layers;
+    std::vector<ggml_tensor *> k_cache;
+    std::vector<ggml_tensor *> v_cache;
     ggml_tensor * output_norm_w = nullptr;
     ggml_tensor * output_w = nullptr;
     int n_threads = 1;
@@ -178,6 +182,8 @@ struct QwenAsrTextDecoderBackend {
     int head_dim = 0;
     int intermediate = 0;
     int vocab = 0;
+    int max_seq_len = 0;
+    int cur_len = 0;
     float rope_theta = 0.0f;
     float rms_norm_eps = 0.0f;
 };
@@ -323,6 +329,135 @@ static ggml_tensor * backend_text_layer_forward_ggml(
     scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
 
     ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, q_dim, tokens);
+
+    ggml_tensor * projected = linear_ggml(ctx, attn, tensors.out_w);
+    ggml_tensor * hidden_states = ggml_add(ctx, x, projected);
+
+    ggml_tensor * ffn_normed = rms_norm_ggml(ctx, hidden_states, tensors.ffn_norm_w, rms_norm_eps);
+    ggml_tensor * gate = linear_ggml(ctx, ffn_normed, tensors.gate_w);
+    ggml_tensor * up = linear_ggml(ctx, ffn_normed, tensors.up_w);
+    ggml_tensor * activated = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    ggml_tensor * down = linear_ggml(ctx, activated, tensors.down_w);
+    return ggml_add(ctx, hidden_states, down);
+}
+
+static ggml_tensor * backend_text_layer_forward_cached_ggml(
+    ggml_context * ctx,
+    const BackendTextLayerTensors & tensors,
+    ggml_tensor * x,
+    ggml_tensor * positions,
+    ggml_tensor * mask,
+    ggml_tensor * k_cache,
+    ggml_tensor * v_cache,
+    int n_past,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    float rope_theta,
+    float rms_norm_eps,
+    ggml_cgraph * graph) {
+    const int tokens = static_cast<int>(x->ne[1]);
+    const int full_tokens = n_past + tokens;
+    const int q_dim = n_heads * head_dim;
+    GGML_UNUSED(hidden);
+    GGML_UNUSED(intermediate);
+
+    ggml_tensor * normed = rms_norm_ggml(ctx, x, tensors.attn_norm_w, rms_norm_eps);
+    ggml_tensor * q = linear_ggml(ctx, normed, tensors.q_w);
+    ggml_tensor * k = linear_ggml(ctx, normed, tensors.k_w);
+    ggml_tensor * v = linear_ggml(ctx, normed, tensors.v_w);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, tokens);
+    k = ggml_reshape_3d(ctx, k, head_dim, n_kv_heads, tokens);
+    v = ggml_reshape_3d(ctx, v, head_dim, n_kv_heads, tokens);
+
+    q = rms_norm_ggml(ctx, q, tensors.q_norm_w, rms_norm_eps);
+    k = rms_norm_ggml(ctx, k, tensors.k_norm_w, rms_norm_eps);
+    q = ggml_rope_ext(
+        ctx,
+        q,
+        positions,
+        nullptr,
+        head_dim,
+        GGML_ROPE_TYPE_NEOX,
+        0,
+        rope_theta,
+        1.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f);
+    k = ggml_rope_ext(
+        ctx,
+        k,
+        positions,
+        nullptr,
+        head_dim,
+        GGML_ROPE_TYPE_NEOX,
+        0,
+        rope_theta,
+        1.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f);
+
+    ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+    const size_t k_offset = static_cast<size_t>(n_past) * k_cache->nb[1];
+    const size_t v_offset = static_cast<size_t>(n_past) * v_cache->nb[1];
+    ggml_tensor * k_dst = ggml_view_3d(
+        ctx,
+        k_cache,
+        head_dim,
+        tokens,
+        n_kv_heads,
+        k_cache->nb[1],
+        k_cache->nb[2],
+        k_offset);
+    ggml_tensor * v_dst = ggml_view_3d(
+        ctx,
+        v_cache,
+        head_dim,
+        tokens,
+        n_kv_heads,
+        v_cache->nb[1],
+        v_cache->nb[2],
+        v_offset);
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, k_perm, k_dst));
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, v_perm, v_dst));
+
+    ggml_tensor * k_full = ggml_view_3d(
+        ctx,
+        k_cache,
+        head_dim,
+        full_tokens,
+        n_kv_heads,
+        k_cache->nb[1],
+        k_cache->nb[2],
+        0);
+    ggml_tensor * v_full = ggml_view_3d(
+        ctx,
+        v_cache,
+        head_dim,
+        full_tokens,
+        n_kv_heads,
+        v_cache->nb[1],
+        v_cache->nb[2],
+        0);
+
+    ggml_tensor * q_p = ggml_permute(ctx, q, 0, 2, 1, 3);
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_full, q_p);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_soft_max_ext(ctx, scores, mask, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
+
+    ggml_tensor * v_t = ggml_cont(ctx, ggml_transpose(ctx, v_full));
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_t, scores);
     ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
     attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
     attn = ggml_reshape_2d(ctx, attn, q_dim, tokens);
@@ -1264,15 +1399,79 @@ void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend) {
         ggml_backend_buffer_free(backend->weight_buffer);
         backend->weight_buffer = nullptr;
     }
+    if (backend->kv_buffer) {
+        ggml_backend_buffer_free(backend->kv_buffer);
+        backend->kv_buffer = nullptr;
+    }
     if (backend->weight_ctx) {
         ggml_free(backend->weight_ctx);
         backend->weight_ctx = nullptr;
+    }
+    if (backend->kv_ctx) {
+        ggml_free(backend->kv_ctx);
+        backend->kv_ctx = nullptr;
     }
     if (backend->backend) {
         ggml_backend_free(backend->backend);
         backend->backend = nullptr;
     }
     delete backend;
+}
+
+static bool text_decoder_backend_alloc_kv_cache(
+    QwenAsrTextDecoderBackend * backend,
+    int max_seq_len,
+    std::string * error) {
+    if (!backend || max_seq_len <= 0) {
+        set_error(error, "invalid text decoder KV-cache configuration");
+        return false;
+    }
+    if (backend->kv_ctx || backend->kv_buffer) {
+        set_error(error, "text decoder KV-cache is already allocated");
+        return false;
+    }
+
+    backend->max_seq_len = max_seq_len;
+    backend->cur_len = 0;
+    backend->k_cache.assign(static_cast<size_t>(backend->n_layers), nullptr);
+    backend->v_cache.assign(static_cast<size_t>(backend->n_layers), nullptr);
+
+    const size_t kv_ctx_size =
+        ggml_tensor_overhead() * static_cast<size_t>(2 * backend->n_layers + 4) + 1024ull * 1024ull;
+    ggml_init_params params;
+    params.mem_size = kv_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    backend->kv_ctx = ggml_init(params);
+    if (!backend->kv_ctx) {
+        set_error(error, "failed to initialize text decoder KV-cache context");
+        return false;
+    }
+
+    for (int layer = 0; layer < backend->n_layers; ++layer) {
+        backend->k_cache[static_cast<size_t>(layer)] = ggml_new_tensor_3d(
+            backend->kv_ctx,
+            GGML_TYPE_F32,
+            backend->head_dim,
+            max_seq_len,
+            backend->n_kv_heads);
+        backend->v_cache[static_cast<size_t>(layer)] = ggml_new_tensor_3d(
+            backend->kv_ctx,
+            GGML_TYPE_F32,
+            backend->head_dim,
+            max_seq_len,
+            backend->n_kv_heads);
+        ggml_set_name(backend->k_cache[static_cast<size_t>(layer)], ("text_k_cache_" + std::to_string(layer)).c_str());
+        ggml_set_name(backend->v_cache[static_cast<size_t>(layer)], ("text_v_cache_" + std::to_string(layer)).c_str());
+    }
+
+    backend->kv_buffer = ggml_backend_alloc_ctx_tensors(backend->kv_ctx, backend->backend);
+    if (!backend->kv_buffer) {
+        set_error(error, "failed to allocate text decoder KV-cache backend buffer");
+        return false;
+    }
+    ggml_backend_buffer_clear(backend->kv_buffer, 0);
+    return true;
 }
 
 bool qwenasr_text_decoder_backend_init(
@@ -1385,6 +1584,167 @@ bool qwenasr_text_decoder_backend_init(
     }
 
     *out = runtime;
+    return true;
+}
+
+bool qwenasr_text_decoder_backend_init_cached(
+    const QwenAsrGgufModel & model,
+    int n_threads,
+    int n_layers,
+    int hidden,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int intermediate,
+    int vocab,
+    int max_seq_len,
+    float rope_theta,
+    float rms_norm_eps,
+    QwenAsrTextDecoderBackend ** out,
+    std::string * error) {
+    if (!out) {
+        set_error(error, "qwenasr_text_decoder_backend_init_cached: out is null");
+        return false;
+    }
+    *out = nullptr;
+    QwenAsrTextDecoderBackend * backend = nullptr;
+    if (!qwenasr_text_decoder_backend_init(
+            model,
+            n_threads,
+            n_layers,
+            hidden,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate,
+            vocab,
+            rope_theta,
+            rms_norm_eps,
+            &backend,
+            error)) {
+        return false;
+    }
+    if (!text_decoder_backend_alloc_kv_cache(backend, max_seq_len, error)) {
+        qwenasr_text_decoder_backend_free(backend);
+        return false;
+    }
+    *out = backend;
+    return true;
+}
+
+static bool text_decoder_backend_cached_logits(
+    QwenAsrTextDecoderBackend * backend,
+    const float * input_values,
+    int tokens,
+    int n_past,
+    std::vector<float> * logits,
+    std::string * error) {
+    if (!backend || !input_values || !logits) {
+        set_error(error, "text_decoder_backend_cached_logits: invalid arguments");
+        return false;
+    }
+    if (!backend->kv_ctx || !backend->kv_buffer || tokens <= 0 || n_past < 0 ||
+        n_past + tokens > backend->max_seq_len) {
+        set_error(error, "invalid text decoder cached forward configuration");
+        return false;
+    }
+
+    constexpr size_t max_nodes = 8192;
+    const size_t graph_ctx_size =
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    ggml_init_params params;
+    params.mem_size = graph_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize text cached decode graph context");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, backend->hidden, tokens);
+    ggml_set_name(x, "text_cached_input");
+    ggml_set_input(x);
+
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+    ggml_set_name(positions, "text_cached_positions");
+    ggml_set_input(positions);
+
+    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_past + tokens, tokens);
+    ggml_set_name(mask, "text_cached_mask");
+    ggml_set_input(mask);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_tensor * y = x;
+    for (int layer = 0; layer < backend->n_layers; ++layer) {
+        y = backend_text_layer_forward_cached_ggml(
+            ctx,
+            backend->layers[static_cast<size_t>(layer)],
+            y,
+            positions,
+            mask,
+            backend->k_cache[static_cast<size_t>(layer)],
+            backend->v_cache[static_cast<size_t>(layer)],
+            n_past,
+            backend->hidden,
+            backend->n_heads,
+            backend->n_kv_heads,
+            backend->head_dim,
+            backend->intermediate,
+            backend->rope_theta,
+            backend->rms_norm_eps,
+            graph);
+    }
+    y = backend_text_logits_ggml(
+        ctx,
+        y,
+        backend->output_norm_w,
+        backend->output_w,
+        backend->hidden,
+        tokens,
+        backend->rms_norm_eps);
+    ggml_set_name(y, "text_cached_logits");
+    ggml_set_output(y);
+    ggml_build_forward_expand(graph, y);
+
+    ggml_backend_sched_reset(backend->sched);
+    if (!ggml_backend_sched_alloc_graph(backend->sched, graph)) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text cached graph allocation failed");
+        return false;
+    }
+
+    std::vector<int32_t> position_data(static_cast<size_t>(tokens), 0);
+    for (int token = 0; token < tokens; ++token) {
+        position_data[static_cast<size_t>(token)] = n_past + token;
+    }
+
+    std::vector<float> mask_data(static_cast<size_t>(tokens) * static_cast<size_t>(n_past + tokens), -INFINITY);
+    for (int query = 0; query < tokens; ++query) {
+        const int max_key = n_past + query;
+        for (int key = 0; key <= max_key; ++key) {
+            mask_data[static_cast<size_t>(query) * static_cast<size_t>(n_past + tokens) + static_cast<size_t>(key)] = 0.0f;
+        }
+    }
+
+    ggml_backend_tensor_set(x, input_values, 0, static_cast<size_t>(tokens) * backend->hidden * sizeof(float));
+    ggml_backend_tensor_set(positions, position_data.data(), 0, position_data.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    const ggml_status status = ggml_backend_sched_graph_compute(backend->sched, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend text cached graph compute failed");
+        return false;
+    }
+
+    logits->assign(static_cast<size_t>(backend->vocab), 0.0f);
+    ggml_backend_tensor_get(y, logits->data(), 0, logits->size() * sizeof(float));
+    backend->cur_len = n_past + tokens;
+
+    ggml_backend_sched_reset(backend->sched);
+    ggml_free(ctx);
     return true;
 }
 
@@ -1830,6 +2190,110 @@ bool qwenasr_text_generate_cached_cpu(
                 rms_norm_eps,
                 &tensors.output_norm_w,
                 &tensors.output_w,
+                &logits,
+                error)) {
+            return false;
+        }
+    }
+
+    *out = std::move(result);
+    return true;
+}
+
+bool qwenasr_text_generate_cached_backend(
+    QwenAsrTextDecoderBackend * backend,
+    const QwenAsrGgufModel & model,
+    const QwenAsrDecoderInputOutput & input,
+    int max_new_tokens,
+    const std::vector<int32_t> & stop_ids,
+    QwenAsrTextGenerateOutput * out,
+    std::string * error) {
+    if (!backend || !out) {
+        set_error(error, "qwenasr_text_generate_cached_backend: backend or out is null");
+        return false;
+    }
+    if (max_new_tokens < 0) {
+        set_error(error, "max_new_tokens must be non-negative");
+        return false;
+    }
+    if (input.tokens <= 0 || input.hidden != backend->hidden ||
+        input.values.size() != static_cast<size_t>(input.tokens) * input.hidden) {
+        set_error(error, "invalid backend cached text generation input");
+        return false;
+    }
+    if (input.tokens + max_new_tokens > backend->max_seq_len) {
+        set_error(error, "backend text generation exceeds KV-cache capacity");
+        return false;
+    }
+
+    QwenAsrTextGenerateOutput result;
+    result.prompt_tokens = input.tokens;
+    result.total_tokens = input.tokens;
+    result.hidden = input.hidden;
+    result.vocab = backend->vocab;
+    result.generated_ids.reserve(static_cast<size_t>(max_new_tokens));
+    if (max_new_tokens == 0) {
+        *out = std::move(result);
+        return true;
+    }
+
+    QwenAsrGgufTensorView embd;
+    if (!require_f32_tensor(model, "text.token_embd.weight", &embd, error) ||
+        !require_shape(embd, backend->hidden, backend->vocab, error)) {
+        return false;
+    }
+    const float * embedding = tensor_f32(embd);
+
+    backend->cur_len = 0;
+    std::vector<float> logits;
+    if (!text_decoder_backend_cached_logits(
+            backend,
+            input.values.data(),
+            input.tokens,
+            0,
+            &logits,
+            error)) {
+        return false;
+    }
+
+    for (int step = 0; step < max_new_tokens; ++step) {
+        int32_t next_id = -1;
+        float best = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < backend->vocab; ++i) {
+            const float value = logits[static_cast<size_t>(i)];
+            if (value > best) {
+                best = value;
+                next_id = static_cast<int32_t>(i);
+            }
+        }
+        if (next_id < 0 || next_id >= backend->vocab) {
+            set_error(error, "generated token id is out of range");
+            return false;
+        }
+
+        result.generated_ids.push_back(next_id);
+        result.total_tokens = input.tokens + static_cast<int>(result.generated_ids.size());
+        bool stop = false;
+        for (const int32_t stop_id : stop_ids) {
+            if (next_id == stop_id) {
+                stop = true;
+                break;
+            }
+        }
+        if (stop) {
+            result.stopped = true;
+            break;
+        }
+        if (step + 1 >= max_new_tokens) {
+            break;
+        }
+
+        const float * row = embedding + static_cast<size_t>(next_id) * backend->hidden;
+        if (!text_decoder_backend_cached_logits(
+                backend,
+                row,
+                1,
+                backend->cur_len,
                 &logits,
                 error)) {
             return false;
