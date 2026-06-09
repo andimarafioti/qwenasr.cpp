@@ -118,6 +118,7 @@ python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-conv0.gguf 
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-cnn.gguf --include-tensor-prefix audio.conv. --include-tensor-prefix audio.conv_out.
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-layer0.gguf --include-tensor-prefix audio.conv. --include-tensor-prefix audio.conv_out. --include-tensor-prefix audio.blk.0.
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-audio-full.gguf --include-tensor-prefix audio.
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-decoder-input.gguf --include-tensor-prefix audio. --include-tensor-prefix text.token_embd.weight
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
@@ -206,6 +207,16 @@ Qwen3 text decoder:
 python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav
 ```
 
+The decoder input assembly boundary is available as `qwen-asr-decoder-input`.
+It looks up prompt token embeddings, replaces `<|audio_pad|>` positions with
+the native audio encoder output, and emits the embeddings passed into the Qwen3
+text decoder:
+
+```bash
+./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --out decoder-input.f32
+python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
@@ -237,6 +248,7 @@ python benchmarks/bench_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-
 python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-layer0.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --torch-device cpu
+python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -303,6 +315,14 @@ with 8 CPU threads, 333 ms for Torch CPU FP32, and 6.86 ms for Torch CUDA BF16.
 The next native speed step is a qwentts.cpp-style persistent backend scheduler
 with weights uploaded once, instead of rebuilding one CPU graph per audio layer.
 
+For the decoder input assembly boundary, `benchmarks/check_decoder_input.py`
+matches the Torch prompt embedding plus `masked_scatter` path at `4.09e-6` max
+absolute error on JFK with English forced output. `benchmarks/bench_decoder_input.py`
+measured roughly 6.7-8.1 s for C++ GGML with 8 CPU threads, 371 ms for Torch CPU
+FP32, and 7.25 ms for Torch CUDA BF16. This step verifies the native path reaches
+the exact text-decoder input embeddings; the same per-layer graph rebuild cost
+still dominates native time.
+
 ## Implementation Notes
 
 Qwen3-ASR is not a Whisper-style encoder-decoder. It uses a chunked audio
@@ -326,6 +346,6 @@ BPE prompt expansion. It also has a mapped GGUF tensor-data loader, validated
 scalar and GGML implementations of the first audio Conv2D layer, and a validated
 GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
 position embeddings, valid-frame packing, all audio transformer layers, post
-normalization, and the audio projector. The remaining native work is to port the
-Qwen3 decoder/KV cache and replace the current per-call CPU graphs with
-persistent backend graphs.
+normalization, the audio projector, and decoder input embedding assembly. The
+remaining native work is to port the Qwen3 decoder/KV cache and replace the
+current per-call CPU graphs with persistent backend graphs.
