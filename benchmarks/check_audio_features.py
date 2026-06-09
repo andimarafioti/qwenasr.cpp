@@ -74,8 +74,20 @@ def main() -> int:
     if native.shape != ref.shape:
         raise SystemExit(f"shape mismatch: native={native.shape} hf={ref.shape}")
 
+    from qwen_asr.core.transformers_backend.processing_qwen3_asr import _get_feat_extract_output_lengths
+
+    expected_audio_tokens = int(_get_feat_extract_output_lengths(features["attention_mask"].sum(-1))[0])
+    native_audio_tokens = int(meta["audio_tokens"])
+    if native_audio_tokens != expected_audio_tokens:
+        raise SystemExit(
+            f"audio token mismatch: native={native_audio_tokens} hf={expected_audio_tokens}"
+        )
+
     diff = np.abs(native - ref)
     print(f"shape={native.shape}")
+    print(f"audio_tokens={native_audio_tokens}")
+    print(f"feature_chunks={meta['feature_chunks']}")
+    print(f"attention_segments={meta['attention_segments']}")
     print(f"max_abs={float(diff.max()):.8f}")
     print(f"mean_abs={float(diff.mean()):.8f}")
     print(f"native_mean={float(native.mean()):.8f}")

@@ -10,6 +10,51 @@
 #include <string>
 #include <vector>
 
+int qwenasr_audio_output_length(int input_frames) {
+    const int leave = input_frames % 100;
+    const int feat_lengths = (leave == 0) ? 0 : ((leave - 1) / 2 + 1);
+    const int tail = (feat_lengths == 0) ? 0 : ((((feat_lengths - 1) / 2 + 1 - 1) / 2) + 1);
+    return tail + (input_frames / 100) * 13;
+}
+
+QwenAsrAudioGeometry qwenasr_audio_geometry(int feature_len, int n_window, int n_window_infer) {
+    QwenAsrAudioGeometry out;
+    out.feature_len = feature_len;
+    out.chunk_window = n_window * 2;
+    if (feature_len <= 0 || out.chunk_window <= 0) {
+        return out;
+    }
+
+    out.n_chunks = (feature_len + out.chunk_window - 1) / out.chunk_window;
+    out.chunk_input_lengths.reserve(static_cast<size_t>(out.n_chunks));
+    out.chunk_output_lengths.reserve(static_cast<size_t>(out.n_chunks));
+    for (int i = 0; i < out.n_chunks; ++i) {
+        const int offset = i * out.chunk_window;
+        const int remaining = feature_len - offset;
+        const int chunk_len = std::min(out.chunk_window, remaining);
+        const int output_len = qwenasr_audio_output_length(chunk_len);
+        out.chunk_input_lengths.push_back(chunk_len);
+        out.chunk_output_lengths.push_back(output_len);
+        out.max_chunk_input_len = std::max(out.max_chunk_input_len, chunk_len);
+        out.max_chunk_output_len = std::max(out.max_chunk_output_len, output_len);
+        out.audio_tokens += output_len;
+    }
+
+    const int multiplier = n_window_infer / out.chunk_window;
+    out.attention_window = out.max_chunk_output_len * std::max(1, multiplier);
+    if (out.attention_window <= 0) {
+        out.attention_window = out.audio_tokens;
+    }
+    for (int offset = 0; offset < out.audio_tokens; offset += out.attention_window) {
+        QwenAsrAudioSegment segment;
+        segment.offset = offset;
+        segment.length = std::min(out.attention_window, out.audio_tokens - offset);
+        out.attention_segments.push_back(segment);
+    }
+
+    return out;
+}
+
 static uint16_t read_u16_le(std::istream & in) {
     unsigned char b[2] = { 0, 0 };
     in.read(reinterpret_cast<char *>(b), 2);

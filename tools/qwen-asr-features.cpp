@@ -84,6 +84,14 @@ int main(int argc, char ** argv) {
     std::cout << "mels=" << features.n_mels << "\n";
     std::cout << "frames=" << features.n_frames << "\n";
     std::cout << "values=" << features.values.size() << "\n";
+    const QwenAsrAudioGeometry geometry = qwenasr_audio_geometry(features.n_frames);
+    std::cout << "audio_tokens=" << geometry.audio_tokens << "\n";
+    std::cout << "feature_chunks=" << geometry.n_chunks << "\n";
+    std::cout << "chunk_window=" << geometry.chunk_window << "\n";
+    std::cout << "max_chunk_input_len=" << geometry.max_chunk_input_len << "\n";
+    std::cout << "max_chunk_output_len=" << geometry.max_chunk_output_len << "\n";
+    std::cout << "attention_window=" << geometry.attention_window << "\n";
+    std::cout << "attention_segments=" << geometry.attention_segments.size() << "\n";
     std::cout << "min=" << min_value << "\n";
     std::cout << "max=" << max_value << "\n";
     std::cout << "mean=" << (sum / static_cast<double>(features.values.size())) << "\n";
