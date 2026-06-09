@@ -114,6 +114,7 @@ without the large tensors. Full tensor GGUF writing requires the `convert` extra
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-1.7B-snapshot --dry-run
 python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-meta.gguf --metadata-only
+python convert.py /path/to/Qwen3-ASR-0.6B-snapshot -o qwen3-asr-0.6b-conv0.gguf --include-tensor-prefix audio.conv.0.
 ```
 
 The GGML-backed native metadata loader is available as `qwen-asr-gguf-info`:
@@ -150,6 +151,15 @@ by Qwen3-ASR:
 ```bash
 ./build/qwen-asr-features sample.wav --out features.f32
 python benchmarks/check_audio_features.py sample.wav --local-files-only
+```
+
+The first mapped-weight native audio layer is available as
+`qwen-asr-audio-conv`. It runs `audio.conv.0.*` from a GGUF and can be checked
+against the original HF checkpoint tensors:
+
+```bash
+./build/qwen-asr-audio-conv qwen3-asr-0.6b-conv0.gguf sample.wav --out conv0.f32
+python benchmarks/check_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav
 ```
 
 ## Streaming
@@ -229,6 +239,7 @@ The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
 CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
 the C++ surface and comparison harness, and the native path now covers GGUF
 metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
-BPE prompt expansion. It also has a mapped GGUF tensor-data loader ready for
-the future graph weights. The remaining native work is to port the ASR audio
-tower/projector and Qwen3 decoder/KV cache into GGML.
+BPE prompt expansion. It also has a mapped GGUF tensor-data loader and a
+validated scalar implementation of the first audio Conv2D layer. The remaining
+native work is to port the rest of the ASR audio tower/projector and Qwen3
+decoder/KV cache into GGML.

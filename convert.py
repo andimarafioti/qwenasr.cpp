@@ -268,6 +268,10 @@ def _tensor_shape(handle, name: str) -> tuple[int, ...]:
         return tuple(handle.get_tensor(name).shape)
 
 
+def should_include_tensor(name: str, prefixes: tuple[str, ...]) -> bool:
+    return not prefixes or name.startswith(prefixes)
+
+
 def collect_tensor_map(
     files: Iterable[Path],
     expected_shapes: dict[str, tuple[int, ...]] | None = None,
@@ -358,6 +362,7 @@ def write_gguf(
     tokenizer: BpeMetadata,
     *,
     metadata_only: bool = False,
+    include_prefixes: tuple[str, ...] = (),
 ) -> None:
     try:
         import gguf
@@ -370,13 +375,20 @@ def write_gguf(
 
     if not metadata_only:
         files = _iter_safetensors(checkpoint)
+        written = 0
         for file in files:
             with safe_open(file, framework="pt", device="cpu") as handle:
                 for name in handle.keys():
+                    mapped = tensor_map[name]
+                    if not should_include_tensor(mapped, include_prefixes):
+                        continue
                     tensor = handle.get_tensor(name)
                     if str(tensor.dtype) == "torch.bfloat16":
                         tensor = tensor.float()
-                    writer.add_tensor(tensor_map[name], tensor.numpy())
+                    writer.add_tensor(mapped, tensor.numpy())
+                    written += 1
+        if written == 0:
+            raise ValueError("tensor include filters matched no tensors")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -396,6 +408,12 @@ def main() -> int:
         help="write only GGUF metadata; useful for validating the native loader without large tensors",
     )
     parser.add_argument("--dump-map", type=Path, default=None, help="write JSON tensor map")
+    parser.add_argument(
+        "--include-tensor-prefix",
+        action="append",
+        default=[],
+        help="write only tensors whose native name starts with this prefix; may be repeated",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.checkpoint)
@@ -423,7 +441,15 @@ def main() -> int:
         print("status=dry-run-ok")
         return 0
 
-    write_gguf(args.checkpoint, args.out, tensor_map, cfg, tokenizer, metadata_only=args.metadata_only)
+    write_gguf(
+        args.checkpoint,
+        args.out,
+        tensor_map,
+        cfg,
+        tokenizer,
+        metadata_only=args.metadata_only,
+        include_prefixes=tuple(args.include_tensor_prefix),
+    )
     print(f"wrote={args.out}")
     if args.metadata_only:
         print("metadata_only=true")

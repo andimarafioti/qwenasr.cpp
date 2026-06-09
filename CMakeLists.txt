@@ -33,6 +33,7 @@ add_library(qwenasr_native STATIC
     src/native-model.cpp
     src/gguf-model.cpp
     src/audio-features.cpp
+    src/audio-conv.cpp
     src/tokenizer.cpp
 )
 target_include_directories(qwenasr_native PUBLIC
@@ -61,3 +62,7 @@ qwenasr_compile_options(qwen-asr-tokenize)
 add_executable(qwen-asr-weights tools/qwen-asr-weights.cpp)
 target_link_libraries(qwen-asr-weights PRIVATE qwenasr_native)
 qwenasr_compile_options(qwen-asr-weights)
+
+add_executable(qwen-asr-audio-conv tools/qwen-asr-audio-conv.cpp)
+target_link_libraries(qwen-asr-audio-conv PRIVATE qwenasr_native)
+qwenasr_compile_options(qwen-asr-audio-conv)

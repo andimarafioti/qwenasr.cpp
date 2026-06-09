@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from convert import expected_hf_shapes, load_bpe_vocab
+from convert import expected_hf_shapes, load_bpe_vocab, should_include_tensor
 
 
 def _cfg(*, audio_hidden=896, audio_layers=18, text_hidden=1024, text_intermediate=3072):
@@ -67,6 +67,13 @@ class ConvertTokenizerTest(unittest.TestCase):
         self.assertEqual(meta.token_types, [1, 5, 1, 5, 4, 5])
         self.assertEqual(meta.merges, ["a b"])
         self.assertEqual(meta.token_ids["<|im_end|>"], 4)
+
+
+class ConvertWriterTest(unittest.TestCase):
+    def test_include_prefix_filters_native_tensor_names(self):
+        self.assertTrue(should_include_tensor("audio.conv.0.weight", ("audio.conv.0.",)))
+        self.assertFalse(should_include_tensor("audio.conv.1.weight", ("audio.conv.0.",)))
+        self.assertTrue(should_include_tensor("text.token_embd.weight", ()))
 
 
 if __name__ == "__main__":
