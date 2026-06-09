@@ -78,6 +78,26 @@ qwenasr audio.wav --language English --context "Preserve spelling: CUDA, FFmpeg"
 qwenasr audio.wav --size 0.6B --local-files-only
 ```
 
+## C++ CLI
+
+The repo also contains a qwentts.cpp-style C ABI and `qwen-asr` C++ CLI under
+`src/` and `tools/`. The current C++ target is a bridge: it embeds Python and
+calls the package backend through the C ABI, which gives a buildable C++
+harness for benchmarking and for replacing the internals with a native GGML
+runtime.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+./build/qwen-asr sample.wav \
+  --size 0.6B \
+  --backend torch \
+  --dtype bf16 \
+  --language English \
+  --python-path "$PWD:/path/to/venv/lib/python3.12/site-packages"
+```
+
 ## Streaming
 
 Streaming is exposed when the vLLM backend is used:
@@ -103,6 +123,7 @@ python benchmarks/throughput.py sample.wav --size 1.7B --backend torch --languag
 python benchmarks/throughput.py sample.wav --size 0.6B --backend torch --repeat 4
 python benchmarks/profile_torch.py sample.wav --size 0.6B --language English
 python benchmarks/compare_parakeet.py sample.wav --qwen-size 0.6B
+python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --language English
 ```
 
 RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
@@ -121,6 +142,7 @@ bucket:
 | Qwen3-ASR-0.6B | torch + CUDA graph | English | 0.299s | 36.8x |
 | Qwen3-ASR-0.6B | torch + CUDA graph, fp16 | English | 0.294s | 37.4x |
 | Qwen3-ASR-0.6B | torch batched fallback, 4 clips | English | 0.391s | 112.4x |
+| Qwen3-ASR-0.6B | C++ bridge -> torch + CUDA graph | English | 0.340s | 32.4x |
 | Qwen3-ASR-1.7B | torch + CUDA graph | English | 0.644s | 17.1x |
 | nano-parakeet | PyTorch | auto | 0.028s | 397.2x |
 
@@ -148,3 +170,9 @@ The current repo intentionally reuses the official Qwen3-ASR model registration
 for weight compatibility and prompt correctness. The next performance target is
 a lean native/Torch fast path that avoids the official transformers backend's
 per-sample audio encoder loop and adds a captured single-stream decoder path.
+
+The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
+CLI tool, future GGUF conversion, and a GGML runtime. The bridge currently
+validates the C++ surface and comparison harness; the remaining native work is
+to port the Whisper log-mel frontend, ASR audio tower/projector, Qwen tokenizer
+prompt expansion, and Qwen3 decoder/KV cache into GGML.
