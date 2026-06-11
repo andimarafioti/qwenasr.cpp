@@ -1,6 +1,7 @@
 #include "audio-features.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -268,6 +269,61 @@ static std::vector<double> make_mel_filters(int n_freq, int n_mels, int sample_r
     return filters;
 }
 
+// 400 = 16 * 25: radix-2 Cooley-Tukey stages over a table-driven 25-point base DFT.
+constexpr int k_fft_size = 400;
+
+struct QwenAsrFftTwiddles {
+    std::array<double, k_fft_size> cos_v;
+    std::array<double, k_fft_size> sin_v;
+    QwenAsrFftTwiddles() {
+        for (int i = 0; i < k_fft_size; ++i) {
+            const double angle = 2.0 * M_PI * static_cast<double>(i) / k_fft_size;
+            cos_v[static_cast<size_t>(i)] = std::cos(angle);
+            sin_v[static_cast<size_t>(i)] = std::sin(angle);
+        }
+    }
+};
+
+// Forward DFT of in[0], in[stride], ..., in[(n-1)*stride]; n must divide k_fft_size.
+static void fft_real(
+    const double * in,
+    int stride,
+    int n,
+    double * out_re,
+    double * out_im,
+    const QwenAsrFftTwiddles & tw) {
+    const int step = k_fft_size / n;
+    if (n % 2 == 1) {
+        for (int k = 0; k < n; ++k) {
+            double real = 0.0;
+            double imag = 0.0;
+            for (int j = 0; j < n; ++j) {
+                const double x = in[j * stride];
+                const size_t idx = static_cast<size_t>((k * j * step) % k_fft_size);
+                real += x * tw.cos_v[idx];
+                imag -= x * tw.sin_v[idx];
+            }
+            out_re[k] = real;
+            out_im[k] = imag;
+        }
+        return;
+    }
+    const int half = n / 2;
+    fft_real(in, 2 * stride, half, out_re, out_im, tw);
+    fft_real(in + stride, 2 * stride, half, out_re + half, out_im + half, tw);
+    for (int k = 0; k < half; ++k) {
+        const size_t idx = static_cast<size_t>(k * step);
+        const double wr = tw.cos_v[idx];
+        const double wi = -tw.sin_v[idx];
+        const double tr = wr * out_re[half + k] - wi * out_im[half + k];
+        const double ti = wr * out_im[half + k] + wi * out_re[half + k];
+        out_re[half + k] = out_re[k] - tr;
+        out_im[half + k] = out_im[k] - ti;
+        out_re[k] += tr;
+        out_im[k] += ti;
+    }
+}
+
 static int reflect_index(int index, int n) {
     if (n <= 1) {
         return 0;
@@ -322,20 +378,24 @@ bool qwenasr_extract_whisper_features(
     std::vector<double> log_spec(static_cast<size_t>(n_mels * n_frames), 0.0);
     double max_log = -std::numeric_limits<double>::infinity();
 
+    static_assert(n_fft == k_fft_size, "FFT twiddle tables are sized for n_fft");
+    static const QwenAsrFftTwiddles twiddles;
+
     for (int frame = 0; frame < n_frames; ++frame) {
+        double windowed[n_fft];
+        for (int n = 0; n < n_fft; ++n) {
+            const int sample_index = reflect_index(frame * hop + n - n_fft / 2, n_samples);
+            windowed[n] = static_cast<double>(samples[static_cast<size_t>(sample_index)]) *
+                          hann[static_cast<size_t>(n)];
+        }
+
+        double spec_re[n_fft];
+        double spec_im[n_fft];
+        fft_real(windowed, 1, n_fft, spec_re, spec_im, twiddles);
+
         double power[n_freq];
         for (int k = 0; k < n_freq; ++k) {
-            double real = 0.0;
-            double imag = 0.0;
-            for (int n = 0; n < n_fft; ++n) {
-                const int sample_index = reflect_index(frame * hop + n - n_fft / 2, n_samples);
-                const double x = static_cast<double>(samples[static_cast<size_t>(sample_index)]) *
-                                 hann[static_cast<size_t>(n)];
-                const double angle = 2.0 * M_PI * static_cast<double>(k * n) / static_cast<double>(n_fft);
-                real += x * std::cos(angle);
-                imag -= x * std::sin(angle);
-            }
-            power[k] = real * real + imag * imag;
+            power[k] = spec_re[k] * spec_re[k] + spec_im[k] * spec_im[k];
         }
 
         for (int mel = 0; mel < n_mels; ++mel) {

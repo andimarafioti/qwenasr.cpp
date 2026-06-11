@@ -57,12 +57,20 @@ bool qwenasr_audio_encoder_backend_init(
     int hidden,
     int output_dim,
     QwenAsrAudioEncoderBackend ** out,
-    std::string * error);
+    std::string * error,
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto(),
+    int n_mels = 0);
 
 void qwenasr_audio_encoder_backend_free(QwenAsrAudioEncoderBackend * backend);
 
 bool qwenasr_audio_encoder_backend_forward(
     QwenAsrAudioEncoderBackend * backend,
     const QwenAsrAudioPrepOutput & prep,
+    QwenAsrAudioEncoderOutput * out,
+    std::string * error);
+
+bool qwenasr_audio_encoder_backend_forward_features(
+    QwenAsrAudioEncoderBackend * backend,
+    const QwenAsrFeatures & features,
     QwenAsrAudioEncoderOutput * out,
     std::string * error);

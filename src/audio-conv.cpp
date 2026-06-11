@@ -524,7 +524,7 @@ struct PrepBackendPendingCopy {
 };
 
 struct QwenAsrAudioPrepBackend {
-    ggml_backend_t backend = nullptr;
+    QwenAsrGgmlBackendSet backends;
     ggml_backend_sched_t sched = nullptr;
     ggml_context * weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buffer = nullptr;
@@ -582,10 +582,7 @@ void qwenasr_audio_prep_backend_free(QwenAsrAudioPrepBackend * backend) {
         ggml_free(backend->weight_ctx);
         backend->weight_ctx = nullptr;
     }
-    if (backend->backend) {
-        ggml_backend_free(backend->backend);
-        backend->backend = nullptr;
-    }
+    qwenasr_ggml_backend_set_free(&backend->backends);
     delete backend;
 }
 
@@ -594,7 +591,8 @@ bool qwenasr_audio_prep_backend_init(
     int n_threads,
     int n_mels,
     QwenAsrAudioPrepBackend ** out,
-    std::string * error) {
+    std::string * error,
+    QwenAsrGgmlDevice device) {
     if (!out) {
         set_error(error, "qwenasr_audio_prep_backend_init: out is null");
         return false;
@@ -646,17 +644,21 @@ bool qwenasr_audio_prep_backend_init(
     runtime->channels = channels;
     runtime->hidden = static_cast<int>(wout.ne[1]);
 
-    runtime->backend = ggml_backend_cpu_init();
-    if (!runtime->backend) {
+    if (!qwenasr_ggml_backend_set_init(device, n_threads, &runtime->backends, error)) {
         qwenasr_audio_prep_backend_free(runtime);
-        set_error(error, "failed to initialize GGML CPU backend");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
 
     constexpr size_t max_nodes = 1024;
-    ggml_backend_t backends[] = { runtime->backend };
-    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    ggml_backend_t backends[2] = {};
+    qwenasr_ggml_backend_set_array(runtime->backends, backends);
+    runtime->sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        qwenasr_ggml_backend_set_count(runtime->backends),
+        max_nodes,
+        false,
+        true);
     if (!runtime->sched) {
         qwenasr_audio_prep_backend_free(runtime);
         set_error(error, "failed to initialize GGML prep backend scheduler");
@@ -686,7 +688,7 @@ bool qwenasr_audio_prep_backend_init(
     runtime->b2 = new_prep_backend_conv_bias_from_view(runtime->weight_ctx, b2, channels, &pending);
     runtime->wout = new_prep_backend_weight_from_view(runtime->weight_ctx, wout, &pending);
 
-    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backends.primary);
     if (!runtime->weight_buffer) {
         qwenasr_audio_prep_backend_free(runtime);
         set_error(error, "failed to allocate audio prep backend weight buffer");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decoder-input.h"
+#include "ggml-backends.h"
 #include "gguf-model.h"
 
 #include <string>
@@ -70,7 +71,8 @@ bool qwenasr_text_layer_backend_init(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextLayerBackend ** out,
-    std::string * error);
+    std::string * error,
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto());
 
 void qwenasr_text_layer_backend_free(QwenAsrTextLayerBackend * backend);
 
@@ -93,7 +95,8 @@ bool qwenasr_text_decoder_backend_init(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextDecoderBackend ** out,
-    std::string * error);
+    std::string * error,
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto());
 
 bool qwenasr_text_decoder_backend_init_cached(
     const QwenAsrGgufModel & model,
@@ -109,7 +112,8 @@ bool qwenasr_text_decoder_backend_init_cached(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextDecoderBackend ** out,
-    std::string * error);
+    std::string * error,
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto());
 
 void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend);
 

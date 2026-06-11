@@ -16,9 +16,10 @@
 static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out encoder.f32] [--threads N]\n"
-        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched] [--device auto|cpu|gpu]\n"
         << "\n"
-        << "Run native Qwen3-ASR audio CNN, transformer encoder, and projector.\n";
+        << "Run native Qwen3-ASR audio CNN, transformer encoder, and projector.\n"
+        << "Defaults: --backend sched --device auto.\n";
 }
 
 static bool write_raw(const std::string & path, const std::vector<float> & values, std::string * error) {
@@ -50,7 +51,9 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string audio_path;
     std::string out_path;
-    std::string backend = "ggml";
+    std::string backend = "sched";
+    std::string error;
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto();
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -73,6 +76,17 @@ int main(int argc, char ** argv) {
             backend = argv[i];
             if (backend != "ggml" && backend != "sched") {
                 std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
+            continue;
+        }
+        if (arg == "--device") {
+            if (++i >= argc) {
+                std::cerr << "--device requires auto, cpu, or gpu\n";
+                return 2;
+            }
+            if (!qwenasr_ggml_device_from_string(argv[i], &device, &error)) {
+                std::cerr << error << "\n";
                 return 2;
             }
             continue;
@@ -108,7 +122,6 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    std::string error;
     QwenAsrNativeConfig cfg;
     if (!qwenasr_load_gguf_metadata(model_path.c_str(), false, &cfg, &error)) {
         std::cerr << error << "\n";
@@ -138,6 +151,7 @@ int main(int argc, char ** argv) {
     auto encoder_start = std::chrono::steady_clock::now();
     auto encoder_end = encoder_start;
     bool encoder_ok = false;
+    std::string audio_path_name = "direct";
     if (backend == "ggml") {
         encoder_ok = qwenasr_audio_encoder_forward_ggml(
             model,
@@ -151,18 +165,7 @@ int main(int argc, char ** argv) {
         encoder_end = std::chrono::steady_clock::now();
     } else {
         const auto init_start = std::chrono::steady_clock::now();
-        QwenAsrAudioPrepBackend * prep_backend = nullptr;
         QwenAsrAudioEncoderBackend * encoder_backend = nullptr;
-        if (!qwenasr_audio_prep_backend_init(
-                model,
-                n_threads,
-                static_cast<int>(cfg.audio_num_mel_bins),
-                &prep_backend,
-                &error)) {
-            qwenasr_gguf_model_close(&model);
-            std::cerr << error << "\n";
-            return 1;
-        }
         if (!qwenasr_audio_encoder_backend_init(
                 model,
                 n_threads,
@@ -171,8 +174,9 @@ int main(int argc, char ** argv) {
                 static_cast<int>(cfg.audio_d_model),
                 static_cast<int>(cfg.audio_output_dim),
                 &encoder_backend,
-                &error)) {
-            qwenasr_audio_prep_backend_free(prep_backend);
+                &error,
+                device,
+                static_cast<int>(cfg.audio_num_mel_bins))) {
             qwenasr_gguf_model_close(&model);
             std::cerr << error << "\n";
             return 1;
@@ -180,14 +184,38 @@ int main(int argc, char ** argv) {
         const auto init_end = std::chrono::steady_clock::now();
         init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
 
-        QwenAsrAudioPrepOutput prep;
+        audio_path_name = "combined";
         encoder_start = std::chrono::steady_clock::now();
-        encoder_ok =
-            qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error) &&
-            qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &encoder, &error);
+        encoder_ok = qwenasr_audio_encoder_backend_forward_features(encoder_backend, features, &encoder, &error);
         encoder_end = std::chrono::steady_clock::now();
+        if (!encoder_ok) {
+            const auto prep_init_start = std::chrono::steady_clock::now();
+            QwenAsrAudioPrepBackend * prep_backend = nullptr;
+            if (!qwenasr_audio_prep_backend_init(
+                    model,
+                    n_threads,
+                    static_cast<int>(cfg.audio_num_mel_bins),
+                    &prep_backend,
+                    &error,
+                    device)) {
+                qwenasr_audio_encoder_backend_free(encoder_backend);
+                qwenasr_gguf_model_close(&model);
+                std::cerr << error << "\n";
+                return 1;
+            }
+            const auto prep_init_end = std::chrono::steady_clock::now();
+            init_ms += std::chrono::duration<double, std::milli>(prep_init_end - prep_init_start).count();
+
+            QwenAsrAudioPrepOutput prep;
+            audio_path_name = "two-stage";
+            encoder_start = std::chrono::steady_clock::now();
+            encoder_ok =
+                qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error) &&
+                qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &encoder, &error);
+            encoder_end = std::chrono::steady_clock::now();
+            qwenasr_audio_prep_backend_free(prep_backend);
+        }
         qwenasr_audio_encoder_backend_free(encoder_backend);
-        qwenasr_audio_prep_backend_free(prep_backend);
     }
     qwenasr_gguf_model_close(&model);
     if (!encoder_ok) {
@@ -213,6 +241,8 @@ int main(int argc, char ** argv) {
         std::chrono::duration<double, std::milli>(encoder_end - encoder_start).count();
 
     std::cout << "backend=" << backend << "\n";
+    std::cout << "device=" << qwenasr_ggml_device_name(device) << "\n";
+    std::cout << "audio_path=" << audio_path_name << "\n";
     std::cout << "threads=" << n_threads << "\n";
     std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "encoder_ms=" << encoder_ms << "\n";

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <vector>
@@ -66,6 +67,68 @@ static bool require_shape(
         return false;
     }
     return true;
+}
+
+static bool shape_eq(const QwenAsrGgufTensorView & tensor, std::initializer_list<int64_t> shape) {
+    return tensor.ne == std::vector<int64_t>(shape);
+}
+
+static int conv_stride2_pad1_len(int input) {
+    return (input + 1) / 2;
+}
+
+static bool validate_features(const QwenAsrFeatures & features, const char * caller, std::string * error) {
+    if (features.n_mels <= 0 || features.n_frames <= 0) {
+        set_error(error, std::string(caller) + ": features are empty");
+        return false;
+    }
+    if (static_cast<size_t>(features.n_mels * features.n_frames) != features.values.size()) {
+        set_error(error, std::string(caller) + ": feature size mismatch");
+        return false;
+    }
+    return true;
+}
+
+static std::vector<float> build_chunked_feature_input(
+    const QwenAsrFeatures & features,
+    const QwenAsrAudioGeometry & geometry) {
+    const int chunks = geometry.n_chunks;
+    const int frames_in = geometry.max_chunk_input_len;
+    std::vector<float> input_values(
+        static_cast<size_t>(frames_in) * features.n_mels * chunks,
+        0.0f);
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const int chunk_len = geometry.chunk_input_lengths[static_cast<size_t>(chunk)];
+        for (int mel = 0; mel < features.n_mels; ++mel) {
+            for (int frame = 0; frame < chunk_len; ++frame) {
+                const int src_frame = chunk * geometry.chunk_window + frame;
+                if (src_frame >= features.n_frames) {
+                    continue;
+                }
+                const size_t dst =
+                    static_cast<size_t>(frame) +
+                    static_cast<size_t>(frames_in) *
+                        (static_cast<size_t>(mel) + static_cast<size_t>(features.n_mels) * chunk);
+                input_values[dst] = features.values[static_cast<size_t>(mel) * features.n_frames + src_frame];
+            }
+        }
+    }
+    return input_values;
+}
+
+static std::vector<float> build_audio_positional_values(int frames, int hidden) {
+    const int half = hidden / 2;
+    const double log_timescale_increment = std::log(10000.0) / static_cast<double>(half - 1);
+    std::vector<float> positional(static_cast<size_t>(frames) * hidden, 0.0f);
+    for (int frame = 0; frame < frames; ++frame) {
+        for (int i = 0; i < half; ++i) {
+            const double inv_timescale = std::exp(-log_timescale_increment * static_cast<double>(i));
+            const double scaled_time = static_cast<double>(frame) * inv_timescale;
+            positional[static_cast<size_t>(frame) * hidden + i] = static_cast<float>(std::sin(scaled_time));
+            positional[static_cast<size_t>(frame) * hidden + half + i] = static_cast<float>(std::cos(scaled_time));
+        }
+    }
+    return positional;
 }
 
 static void layer_norm(
@@ -343,6 +406,40 @@ static ggml_tensor * layer_norm_ggml(
     return ggml_add(ctx, output, bias);
 }
 
+static ggml_tensor * attention_ggml(
+    ggml_context * ctx,
+    ggml_tensor * q,
+    ggml_tensor * k,
+    ggml_tensor * v,
+    int head_dim,
+    int n_heads,
+    int tokens,
+    bool use_flash_attn) {
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if (use_flash_attn) {
+        ggml_tensor * q_f = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+        ggml_tensor * k_f = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+        ggml_tensor * v_f = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_f, k_f, v_f, nullptr, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        attn = ggml_cont(ctx, attn);
+        return ggml_reshape_2d(ctx, attn, head_dim * n_heads, tokens);
+    }
+
+    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
+
+    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, scale, 0.0f);
+
+    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
+    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
+    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+    return ggml_reshape_2d(ctx, attn, head_dim * n_heads, tokens);
+}
+
 static bool audio_layer_forward_ggml_values(
     const QwenAsrGgufModel & model,
     const std::vector<float> & input_values,
@@ -413,18 +510,15 @@ static bool audio_layer_forward_ggml_values(
     k = ggml_reshape_3d(ctx, k, head_dim, n_heads, tokens);
     v = ggml_reshape_3d(ctx, v, head_dim, n_heads, tokens);
 
-    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
-
-    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
-    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
-    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
-    attn = ggml_reshape_2d(ctx, attn, hidden, tokens);
+    ggml_tensor * attn = attention_ggml(
+        ctx,
+        q,
+        k,
+        v,
+        head_dim,
+        n_heads,
+        tokens,
+        qwenasr_ggml_flash_attn_enabled());
 
     ggml_tensor * projected = linear_ggml(ctx, attn, out_w, out_b);
     ggml_tensor * hidden_states = ggml_add(ctx, x, projected);
@@ -532,8 +626,18 @@ struct BackendAudioProjectorTensors {
     ggml_tensor * proj1_b = nullptr;
 };
 
+struct BackendAudioPrepTensors {
+    ggml_tensor * w0 = nullptr;
+    ggml_tensor * b0 = nullptr;
+    ggml_tensor * w1 = nullptr;
+    ggml_tensor * b1 = nullptr;
+    ggml_tensor * w2 = nullptr;
+    ggml_tensor * b2 = nullptr;
+    ggml_tensor * wout = nullptr;
+};
+
 struct QwenAsrAudioEncoderBackend {
-    ggml_backend_t backend = nullptr;
+    QwenAsrGgmlBackendSet backends;
     ggml_backend_sched_t sched = nullptr;
     ggml_context * weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buffer = nullptr;
@@ -542,7 +646,11 @@ struct QwenAsrAudioEncoderBackend {
     int n_heads = 0;
     int hidden = 0;
     int output_dim = 0;
+    bool has_prep = false;
+    int prep_n_mels = 0;
+    int prep_channels = 0;
     std::vector<BackendAudioLayerTensors> layers;
+    BackendAudioPrepTensors prep;
     BackendAudioProjectorTensors projector;
 };
 
@@ -555,6 +663,17 @@ static ggml_tensor * new_backend_weight_from_view(
         view.type,
         static_cast<int>(view.ne.size()),
         view.ne.data());
+    ggml_set_name(tensor, view.name.c_str());
+    pending->push_back(BackendPendingCopy { tensor, view.data, ggml_nbytes(tensor) });
+    return tensor;
+}
+
+static ggml_tensor * new_backend_conv_bias_from_view(
+    ggml_context * ctx,
+    const QwenAsrGgufTensorView & view,
+    int channels,
+    std::vector<BackendPendingCopy> * pending) {
+    ggml_tensor * tensor = ggml_new_tensor_4d(ctx, view.type, 1, 1, channels, 1);
     ggml_set_name(tensor, view.name.c_str());
     pending->push_back(BackendPendingCopy { tensor, view.data, ggml_nbytes(tensor) });
     return tensor;
@@ -581,6 +700,71 @@ static BackendAudioLayerTensors backend_audio_layer_tensors_from_views(
     tensors.up_b = new_backend_weight_from_view(ctx, views.up_b, pending);
     tensors.down_w = new_backend_weight_from_view(ctx, views.down_w, pending);
     tensors.down_b = new_backend_weight_from_view(ctx, views.down_b, pending);
+    return tensors;
+}
+
+struct AudioPrepTensorViews {
+    QwenAsrGgufTensorView w0;
+    QwenAsrGgufTensorView b0;
+    QwenAsrGgufTensorView w1;
+    QwenAsrGgufTensorView b1;
+    QwenAsrGgufTensorView w2;
+    QwenAsrGgufTensorView b2;
+    QwenAsrGgufTensorView wout;
+    int channels = 0;
+};
+
+static bool load_audio_prep_tensors(
+    const QwenAsrGgufModel & model,
+    int n_mels,
+    int hidden,
+    AudioPrepTensorViews * views,
+    std::string * error) {
+    if (!views || n_mels <= 0 || hidden <= 0) {
+        set_error(error, "invalid audio prep tensor configuration");
+        return false;
+    }
+    if (!require_f32_tensor(model, "audio.conv.0.weight", &views->w0, error) ||
+        !require_f32_tensor(model, "audio.conv.0.bias", &views->b0, error) ||
+        !require_f32_tensor(model, "audio.conv.1.weight", &views->w1, error) ||
+        !require_f32_tensor(model, "audio.conv.1.bias", &views->b1, error) ||
+        !require_f32_tensor(model, "audio.conv.2.weight", &views->w2, error) ||
+        !require_f32_tensor(model, "audio.conv.2.bias", &views->b2, error) ||
+        !require_f32_tensor(model, "audio.conv_out.weight", &views->wout, error)) {
+        return false;
+    }
+
+    views->channels = static_cast<int>(views->w0.ne.size() == 4 ? views->w0.ne[3] : 0);
+    const int freq_out = conv_stride2_pad1_len(conv_stride2_pad1_len(conv_stride2_pad1_len(n_mels)));
+    const int conv_out_width = views->channels * freq_out;
+    if (views->channels <= 0 || freq_out <= 0 ||
+        !shape_eq(views->w0, { 3, 3, 1, views->channels }) ||
+        !shape_eq(views->b0, { views->channels }) ||
+        !shape_eq(views->w1, { 3, 3, views->channels, views->channels }) ||
+        !shape_eq(views->b1, { views->channels }) ||
+        !shape_eq(views->w2, { 3, 3, views->channels, views->channels }) ||
+        !shape_eq(views->b2, { views->channels }) ||
+        views->wout.ne.size() != 2 ||
+        views->wout.ne[0] != conv_out_width ||
+        views->wout.ne[1] != hidden) {
+        set_error(error, "audio prep tensor shape mismatch");
+        return false;
+    }
+    return true;
+}
+
+static BackendAudioPrepTensors backend_audio_prep_tensors_from_views(
+    ggml_context * ctx,
+    const AudioPrepTensorViews & views,
+    std::vector<BackendPendingCopy> * pending) {
+    BackendAudioPrepTensors tensors;
+    tensors.w0 = new_backend_weight_from_view(ctx, views.w0, pending);
+    tensors.b0 = new_backend_conv_bias_from_view(ctx, views.b0, views.channels, pending);
+    tensors.w1 = new_backend_weight_from_view(ctx, views.w1, pending);
+    tensors.b1 = new_backend_conv_bias_from_view(ctx, views.b1, views.channels, pending);
+    tensors.w2 = new_backend_weight_from_view(ctx, views.w2, pending);
+    tensors.b2 = new_backend_conv_bias_from_view(ctx, views.b2, views.channels, pending);
+    tensors.wout = new_backend_weight_from_view(ctx, views.wout, pending);
     return tensors;
 }
 
@@ -641,18 +825,15 @@ static ggml_tensor * backend_audio_layer_forward_ggml(
     k = ggml_reshape_3d(ctx, k, head_dim, n_heads, tokens);
     v = ggml_reshape_3d(ctx, v, head_dim, n_heads, tokens);
 
-    ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
-    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-    scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f);
-
-    ggml_tensor * attn = ggml_mul_mat(ctx, v_p, scores);
-    ggml_mul_mat_set_prec(attn, GGML_PREC_F32);
-    attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
-    attn = ggml_reshape_2d(ctx, attn, hidden, tokens);
+    ggml_tensor * attn = attention_ggml(
+        ctx,
+        q,
+        k,
+        v,
+        head_dim,
+        n_heads,
+        tokens,
+        qwenasr_ggml_flash_attn_enabled());
 
     ggml_tensor * projected = linear_ggml(ctx, attn, tensors.out_w, tensors.out_b);
     ggml_tensor * hidden_states = ggml_add(ctx, x, projected);
@@ -674,6 +855,37 @@ static ggml_tensor * backend_audio_projector_forward_ggml(
     return linear_ggml(ctx, y, tensors.proj1_w, tensors.proj1_b);
 }
 
+static ggml_tensor * backend_audio_prep_forward_ggml(
+    ggml_context * ctx,
+    const BackendAudioPrepTensors & tensors,
+    ggml_tensor * x,
+    ggml_tensor * positional,
+    int channels,
+    int hidden,
+    int n_mels,
+    int frames_out,
+    int chunks) {
+    const int freq_out = conv_stride2_pad1_len(conv_stride2_pad1_len(conv_stride2_pad1_len(n_mels)));
+    const int conv_out_width = channels * freq_out;
+
+    auto conv_gelu = [&](ggml_tensor * input, ggml_tensor * weight, ggml_tensor * bias) -> ggml_tensor * {
+        ggml_tensor * y = ggml_conv_2d(ctx, weight, input, 2, 2, 1, 1, 1, 1);
+        y = ggml_add(ctx, y, ggml_repeat(ctx, bias, y));
+        return ggml_gelu_erf(ctx, y);
+    };
+
+    ggml_tensor * y = conv_gelu(x, tensors.w0, tensors.b0);
+    y = conv_gelu(y, tensors.w1, tensors.b1);
+    y = conv_gelu(y, tensors.w2, tensors.b2);
+    y = ggml_cont(ctx, ggml_permute(ctx, y, 2, 0, 1, 3));
+    y = ggml_reshape_2d(ctx, y, conv_out_width, frames_out * chunks);
+    y = ggml_mul_mat(ctx, tensors.wout, y);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    y = ggml_reshape_3d(ctx, y, hidden, frames_out, chunks);
+    y = ggml_add(ctx, y, ggml_repeat(ctx, positional, y));
+    return ggml_reshape_2d(ctx, y, hidden, frames_out * chunks);
+}
+
 void qwenasr_audio_encoder_backend_free(QwenAsrAudioEncoderBackend * backend) {
     if (!backend) {
         return;
@@ -690,10 +902,7 @@ void qwenasr_audio_encoder_backend_free(QwenAsrAudioEncoderBackend * backend) {
         ggml_free(backend->weight_ctx);
         backend->weight_ctx = nullptr;
     }
-    if (backend->backend) {
-        ggml_backend_free(backend->backend);
-        backend->backend = nullptr;
-    }
+    qwenasr_ggml_backend_set_free(&backend->backends);
     delete backend;
 }
 
@@ -705,7 +914,9 @@ bool qwenasr_audio_encoder_backend_init(
     int hidden,
     int output_dim,
     QwenAsrAudioEncoderBackend ** out,
-    std::string * error) {
+    std::string * error,
+    QwenAsrGgmlDevice device,
+    int n_mels) {
     if (!out) {
         set_error(error, "qwenasr_audio_encoder_backend_init: out is null");
         return false;
@@ -725,25 +936,31 @@ bool qwenasr_audio_encoder_backend_init(
     runtime->n_heads = n_heads;
     runtime->hidden = hidden;
     runtime->output_dim = output_dim;
+    runtime->has_prep = n_mels > 0;
+    runtime->prep_n_mels = n_mels;
 
-    runtime->backend = ggml_backend_cpu_init();
-    if (!runtime->backend) {
+    if (!qwenasr_ggml_backend_set_init(device, n_threads, &runtime->backends, error)) {
         qwenasr_audio_encoder_backend_free(runtime);
-        set_error(error, "failed to initialize GGML CPU backend");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
 
-    constexpr size_t max_nodes = 4096;
-    ggml_backend_t backends[] = { runtime->backend };
-    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    constexpr size_t max_nodes = 8192;
+    ggml_backend_t backends[2] = {};
+    qwenasr_ggml_backend_set_array(runtime->backends, backends);
+    runtime->sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        qwenasr_ggml_backend_set_count(runtime->backends),
+        max_nodes,
+        false,
+        true);
     if (!runtime->sched) {
         qwenasr_audio_encoder_backend_free(runtime);
         set_error(error, "failed to initialize GGML backend scheduler");
         return false;
     }
 
-    const int n_weight_tensors = n_layers * 16 + 6;
+    const int n_weight_tensors = n_layers * 16 + 6 + (runtime->has_prep ? 7 : 0);
     const size_t weight_ctx_size = static_cast<size_t>(n_weight_tensors) * ggml_tensor_overhead() + 1024ull * 1024ull;
     ggml_init_params params;
     params.mem_size = weight_ctx_size;
@@ -758,6 +975,16 @@ bool qwenasr_audio_encoder_backend_init(
 
     std::vector<BackendPendingCopy> pending;
     pending.reserve(static_cast<size_t>(n_weight_tensors));
+    if (runtime->has_prep) {
+        AudioPrepTensorViews prep_views;
+        if (!load_audio_prep_tensors(model, n_mels, hidden, &prep_views, error)) {
+            qwenasr_audio_encoder_backend_free(runtime);
+            return false;
+        }
+        runtime->prep_channels = prep_views.channels;
+        runtime->prep = backend_audio_prep_tensors_from_views(runtime->weight_ctx, prep_views, &pending);
+    }
+
     runtime->layers.reserve(static_cast<size_t>(n_layers));
     for (int layer = 0; layer < n_layers; ++layer) {
         AudioLayerTensors views;
@@ -775,7 +1002,7 @@ bool qwenasr_audio_encoder_backend_init(
     }
     runtime->projector = backend_audio_projector_tensors_from_views(runtime->weight_ctx, projector_views, &pending);
 
-    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backends.primary);
     if (!runtime->weight_buffer) {
         qwenasr_audio_encoder_backend_free(runtime);
         set_error(error, "failed to allocate audio encoder backend weight buffer");
@@ -854,6 +1081,117 @@ bool qwenasr_audio_encoder_backend_forward(
     result.hidden = backend->output_dim;
     result.attention_segments = prep.attention_segments;
     result.values.assign(static_cast<size_t>(prep.tokens) * backend->output_dim, 0.0f);
+    ggml_backend_tensor_get(y, result.values.data(), 0, result.values.size() * sizeof(float));
+
+    ggml_backend_sched_reset(backend->sched);
+    ggml_free(ctx);
+    *out = std::move(result);
+    return true;
+}
+
+bool qwenasr_audio_encoder_backend_forward_features(
+    QwenAsrAudioEncoderBackend * backend,
+    const QwenAsrFeatures & features,
+    QwenAsrAudioEncoderOutput * out,
+    std::string * error) {
+    if (!backend || !out) {
+        set_error(error, "qwenasr_audio_encoder_backend_forward_features: backend or out is null");
+        return false;
+    }
+    if (!backend->has_prep) {
+        set_error(error, "audio encoder backend was not initialized with prep tensors");
+        return false;
+    }
+    if (!qwenasr_ggml_combined_audio_enabled()) {
+        set_error(error, "audio encoder combined fast path is disabled");
+        return false;
+    }
+    if (!validate_features(features, "qwenasr_audio_encoder_backend_forward_features", error)) {
+        return false;
+    }
+    if (features.n_mels != backend->prep_n_mels) {
+        set_error(error, "audio encoder backend mel count mismatch");
+        return false;
+    }
+
+    const QwenAsrAudioGeometry geometry = qwenasr_audio_geometry(features.n_frames);
+    const int chunks = geometry.n_chunks;
+    const int frames_in = geometry.max_chunk_input_len;
+    const int frames_out = qwenasr_audio_output_length(frames_in);
+    if (chunks <= 0 || frames_in <= 0 || frames_out <= 0) {
+        set_error(error, "audio encoder combined output geometry is empty");
+        return false;
+    }
+    if (geometry.audio_tokens != chunks * frames_out) {
+        set_error(error, "audio encoder combined fast path requires full audio chunks");
+        return false;
+    }
+
+    std::vector<float> input_values = build_chunked_feature_input(features, geometry);
+    std::vector<float> positional = build_audio_positional_values(frames_out, backend->hidden);
+
+    constexpr size_t max_nodes = 8192;
+    const size_t graph_ctx_size =
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    ggml_init_params params;
+    params.mem_size = graph_ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, "failed to initialize combined audio encoder graph context");
+        return false;
+    }
+
+    ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, frames_in, features.n_mels, 1, chunks);
+    ggml_set_name(x, "audio_encoder_features_input");
+    ggml_set_input(x);
+
+    ggml_tensor * pos = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, backend->hidden, frames_out, 1);
+    ggml_set_name(pos, "audio_encoder_positional");
+    ggml_set_input(pos);
+
+    ggml_tensor * y = backend_audio_prep_forward_ggml(
+        ctx,
+        backend->prep,
+        x,
+        pos,
+        backend->prep_channels,
+        backend->hidden,
+        features.n_mels,
+        frames_out,
+        chunks);
+    for (int layer = 0; layer < backend->n_layers; ++layer) {
+        y = backend_audio_layer_forward_ggml(ctx, backend->layers[static_cast<size_t>(layer)], y, backend->hidden, backend->n_heads);
+    }
+    y = backend_audio_projector_forward_ggml(ctx, backend->projector, y);
+    ggml_set_name(y, "audio_encoder_combined_output");
+    ggml_set_output(y);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, y);
+    if (!ggml_backend_sched_alloc_graph(backend->sched, graph)) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend combined audio encoder graph allocation failed");
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, input_values.data(), 0, input_values.size() * sizeof(float));
+    ggml_backend_tensor_set(pos, positional.data(), 0, positional.size() * sizeof(float));
+    const ggml_status status = ggml_backend_sched_graph_compute(backend->sched, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_reset(backend->sched);
+        ggml_free(ctx);
+        set_error(error, "GGML backend combined audio encoder graph compute failed");
+        return false;
+    }
+
+    QwenAsrAudioEncoderOutput result;
+    result.tokens = geometry.audio_tokens;
+    result.hidden = backend->output_dim;
+    result.attention_segments = geometry.attention_segments;
+    result.values.assign(static_cast<size_t>(geometry.audio_tokens) * backend->output_dim, 0.0f);
     ggml_backend_tensor_get(y, result.values.data(), 0, result.values.size() * sizeof(float));
 
     ggml_backend_sched_reset(backend->sched);

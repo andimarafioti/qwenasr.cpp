@@ -38,6 +38,7 @@ def _dump_native_encoder(
     audio: Path,
     n_threads: int,
     backend: str,
+    device: str,
 ) -> tuple[np.ndarray, dict[str, str]]:
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -52,6 +53,8 @@ def _dump_native_encoder(
                     str(n_threads),
                     "--backend",
                     backend,
+                    "--device",
+                    device,
                     "--out",
                     str(tmp_path),
                 ]
@@ -121,6 +124,7 @@ def main() -> int:
     parser.add_argument("--layers", type=int, default=18)
     parser.add_argument("--heads", type=int, default=14)
     parser.add_argument("--native-backend", choices=("ggml", "sched"), default="ggml")
+    parser.add_argument("--native-device", choices=("auto", "cpu", "gpu", "cuda"), default="auto")
     parser.add_argument("--atol", type=float, default=5e-3)
     args = parser.parse_args()
 
@@ -138,6 +142,7 @@ def main() -> int:
         args.audio,
         args.threads,
         args.native_backend,
+        args.native_device,
     )
 
     try:
@@ -182,6 +187,7 @@ def main() -> int:
     max_abs = float(diff.max())
     print(f"shape={native.shape}")
     print(f"native_backend={encoder_meta['backend']}")
+    print(f"native_device={encoder_meta.get('device', args.native_device)}")
     print(f"native_encoder_ms={float(encoder_meta['encoder_ms']):.3f}")
     print(f"max_abs={max_abs:.8f}")
     print(f"mean_abs={float(diff.mean()):.8f}")

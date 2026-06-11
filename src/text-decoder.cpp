@@ -146,7 +146,7 @@ struct BackendTextLayerTensors {
 };
 
 struct QwenAsrTextLayerBackend {
-    ggml_backend_t backend = nullptr;
+    QwenAsrGgmlBackendSet backends;
     ggml_backend_sched_t sched = nullptr;
     ggml_context * weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buffer = nullptr;
@@ -163,7 +163,7 @@ struct QwenAsrTextLayerBackend {
 };
 
 struct QwenAsrTextDecoderBackend {
-    ggml_backend_t backend = nullptr;
+    QwenAsrGgmlBackendSet backends;
     ggml_backend_sched_t sched = nullptr;
     ggml_context * weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buffer = nullptr;
@@ -1197,10 +1197,7 @@ void qwenasr_text_layer_backend_free(QwenAsrTextLayerBackend * backend) {
         ggml_free(backend->weight_ctx);
         backend->weight_ctx = nullptr;
     }
-    if (backend->backend) {
-        ggml_backend_free(backend->backend);
-        backend->backend = nullptr;
-    }
+    qwenasr_ggml_backend_set_free(&backend->backends);
     delete backend;
 }
 
@@ -1216,7 +1213,8 @@ bool qwenasr_text_layer_backend_init(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextLayerBackend ** out,
-    std::string * error) {
+    std::string * error,
+    QwenAsrGgmlDevice device) {
     if (!out) {
         set_error(error, "qwenasr_text_layer_backend_init: out is null");
         return false;
@@ -1244,17 +1242,21 @@ bool qwenasr_text_layer_backend_init(
     runtime->rope_theta = rope_theta;
     runtime->rms_norm_eps = rms_norm_eps;
 
-    runtime->backend = ggml_backend_cpu_init();
-    if (!runtime->backend) {
+    if (!qwenasr_ggml_backend_set_init(device, n_threads, &runtime->backends, error)) {
         qwenasr_text_layer_backend_free(runtime);
-        set_error(error, "failed to initialize GGML CPU backend for text layer");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
 
     constexpr size_t max_nodes = 4096;
-    ggml_backend_t backends[] = { runtime->backend };
-    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    ggml_backend_t backends[2] = {};
+    qwenasr_ggml_backend_set_array(runtime->backends, backends);
+    runtime->sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        qwenasr_ggml_backend_set_count(runtime->backends),
+        max_nodes,
+        false,
+        true);
     if (!runtime->sched) {
         qwenasr_text_layer_backend_free(runtime);
         set_error(error, "failed to initialize GGML text layer backend scheduler");
@@ -1284,7 +1286,7 @@ bool qwenasr_text_layer_backend_init(
     pending.reserve(static_cast<size_t>(n_weight_tensors));
     runtime->tensors = backend_text_layer_tensors_from_views(runtime->weight_ctx, views, &pending);
 
-    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backends.primary);
     if (!runtime->weight_buffer) {
         qwenasr_text_layer_backend_free(runtime);
         set_error(error, "failed to allocate text layer backend weight buffer");
@@ -1411,10 +1413,7 @@ void qwenasr_text_decoder_backend_free(QwenAsrTextDecoderBackend * backend) {
         ggml_free(backend->kv_ctx);
         backend->kv_ctx = nullptr;
     }
-    if (backend->backend) {
-        ggml_backend_free(backend->backend);
-        backend->backend = nullptr;
-    }
+    qwenasr_ggml_backend_set_free(&backend->backends);
     delete backend;
 }
 
@@ -1465,7 +1464,7 @@ static bool text_decoder_backend_alloc_kv_cache(
         ggml_set_name(backend->v_cache[static_cast<size_t>(layer)], ("text_v_cache_" + std::to_string(layer)).c_str());
     }
 
-    backend->kv_buffer = ggml_backend_alloc_ctx_tensors(backend->kv_ctx, backend->backend);
+    backend->kv_buffer = ggml_backend_alloc_ctx_tensors(backend->kv_ctx, backend->backends.primary);
     if (!backend->kv_buffer) {
         set_error(error, "failed to allocate text decoder KV-cache backend buffer");
         return false;
@@ -1487,7 +1486,8 @@ bool qwenasr_text_decoder_backend_init(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextDecoderBackend ** out,
-    std::string * error) {
+    std::string * error,
+    QwenAsrGgmlDevice device) {
     if (!out) {
         set_error(error, "qwenasr_text_decoder_backend_init: out is null");
         return false;
@@ -1517,17 +1517,21 @@ bool qwenasr_text_decoder_backend_init(
     runtime->rope_theta = rope_theta;
     runtime->rms_norm_eps = rms_norm_eps;
 
-    runtime->backend = ggml_backend_cpu_init();
-    if (!runtime->backend) {
+    if (!qwenasr_ggml_backend_set_init(device, n_threads, &runtime->backends, error)) {
         qwenasr_text_decoder_backend_free(runtime);
-        set_error(error, "failed to initialize GGML CPU backend for text decoder");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(runtime->backend, n_threads);
 
     constexpr size_t max_nodes = 8192;
-    ggml_backend_t backends[] = { runtime->backend };
-    runtime->sched = ggml_backend_sched_new(backends, nullptr, 1, max_nodes, false, true);
+    ggml_backend_t backends[2] = {};
+    qwenasr_ggml_backend_set_array(runtime->backends, backends);
+    runtime->sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        qwenasr_ggml_backend_set_count(runtime->backends),
+        max_nodes,
+        false,
+        true);
     if (!runtime->sched) {
         qwenasr_text_decoder_backend_free(runtime);
         set_error(error, "failed to initialize GGML text decoder backend scheduler");
@@ -1571,7 +1575,7 @@ bool qwenasr_text_decoder_backend_init(
     runtime->output_norm_w = new_backend_weight_from_view(runtime->weight_ctx, output_norm_w, &pending);
     runtime->output_w = new_backend_weight_from_view(runtime->weight_ctx, output_w, &pending);
 
-    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backend);
+    runtime->weight_buffer = ggml_backend_alloc_ctx_tensors(runtime->weight_ctx, runtime->backends.primary);
     if (!runtime->weight_buffer) {
         qwenasr_text_decoder_backend_free(runtime);
         set_error(error, "failed to allocate text decoder backend weight buffer");
@@ -1601,7 +1605,8 @@ bool qwenasr_text_decoder_backend_init_cached(
     float rope_theta,
     float rms_norm_eps,
     QwenAsrTextDecoderBackend ** out,
-    std::string * error) {
+    std::string * error,
+    QwenAsrGgmlDevice device) {
     if (!out) {
         set_error(error, "qwenasr_text_decoder_backend_init_cached: out is null");
         return false;
@@ -1621,7 +1626,8 @@ bool qwenasr_text_decoder_backend_init_cached(
             rope_theta,
             rms_norm_eps,
             &backend,
-            error)) {
+            error,
+            device)) {
         return false;
     }
     if (!text_decoder_backend_alloc_kv_cache(backend, max_seq_len, error)) {
