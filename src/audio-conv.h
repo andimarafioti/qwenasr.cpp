@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio-features.h"
+#include "ggml-backends.h"
 #include "gguf-model.h"
 
 #include <string>
@@ -66,7 +67,8 @@ bool qwenasr_audio_prep_backend_init(
     int n_threads,
     int n_mels,
     QwenAsrAudioPrepBackend ** out,
-    std::string * error);
+    std::string * error,
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto());
 
 void qwenasr_audio_prep_backend_free(QwenAsrAudioPrepBackend * backend);
 

@@ -1,109 +1,48 @@
 # qwenasr.cpp
 
-Installable Qwen3-ASR inference for the 0.6B and 1.7B models, with a small API
-modeled after `nano-parakeet` and `faster-qwen3-tts`.
+Native C++/GGML implementation work for Qwen3-ASR 0.6B and 1.7B.
 
-```python
-from qwenasr_cpp import from_pretrained
+The fast Torch/vLLM CUDA runtime was split into
+[`faster-qwen-asr`](https://github.com/andimarafioti/faster-qwen-asr). This
+repository now focuses on GGUF conversion, native audio/text graph validation,
+and qwentts.cpp-style GGML backend execution.
 
-model = from_pretrained(size="0.6B")      # Qwen/Qwen3-ASR-0.6B
-print(model.transcribe("audio.wav"))
-```
+## faster-qwen-asr benchmark
 
-The first implementation path is correctness-first and CUDA-friendly:
+The split Torch/CUDA runtime in
+[`faster-qwen-asr`](https://github.com/andimarafioti/faster-qwen-asr) was
+benchmarked on June 10, 2026 on an NVIDIA GB10 with PyTorch 2.11.0+cu130, CUDA
+13.0, and driver 580.126.09. The test audio was an 11.0s 16 kHz mono JFK clip,
+forced English, `--backend torch --dtype bf16`, one warmup, and five timed
+runs. RTF > 1.0 is faster than real time.
 
-- `backend="vllm"` uses the Qwen3-ASR vLLM backend for highest throughput.
-- `backend="torch"` uses a manual greedy decoder with CUDA graph capture on top
-  of the official Torch model.
-- `backend="transformers"` uses the official transformers backend.
-- `backend="auto"` picks vLLM when it is installed on a CUDA machine, otherwise
-  uses the manual Torch path and falls back to transformers only when Torch is absent.
-- The Torch backend defaults to eager attention because it is faster for the
-  single-token graph loop on the tested GB10 setup; the transformers baseline
-  defaults to SDPA.
-- CUDA defaults enable TF32 matmul and choose bfloat16 on GPUs that support it.
+| Model | Dynamic decode latency | Dynamic RTF | CUDA graph latency | CUDA graph RTF | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3-ASR-0.6B | 0.3951s | 27.84 | 0.2863s | 38.42 | 1.38x |
+| Qwen3-ASR-1.7B | 1.5435s | 7.13 | 0.6296s | 17.47 | 2.45x |
 
-## Install
+Full run metadata is tracked in
+[`bench_results_NVIDIA_GB10.json`](https://github.com/andimarafioti/faster-qwen-asr/blob/main/bench_results_NVIDIA_GB10.json).
 
-```bash
-pip install qwenasr-cpp
-```
-
-For the fast vLLM backend:
-
-```bash
-pip install "qwenasr-cpp[fast]"
-```
-
-For checkpoint conversion utilities:
-
-```bash
-pip install "qwenasr-cpp[convert]"
-```
-
-The upstream Qwen3-ASR package currently pins `transformers==4.57.6`. Use a fresh
-environment if you already have a large ML stack installed.
-
-## Python API
-
-```python
-from qwenasr_cpp import QwenASR, from_pretrained
-
-asr = from_pretrained(
-    size="1.7B",
-    backend="auto",
-    max_new_tokens=256,
-    max_batch_size=32,
-)
-
-text = asr.transcribe("speech.wav", language="English")
-print(text)
-
-results = asr.transcribe(
-    ["a.wav", "b.wav"],
-    language=[None, "English"],
-    return_result=True,
-)
-for result in results:
-    print(result.language, result.text)
-```
-
-`audio` can be a local path, URL, base64 data URL, `(numpy_array, sample_rate)`,
-or a `torch.Tensor` sampled at 16 kHz.
-
-## CLI
-
-```bash
-qwenasr audio.wav
-qwenasr audio.wav --backend torch
-qwenasr audio.wav --backend torch --attn-implementation sdpa
-qwenasr audio.wav --backend torch --no-cuda-graph
-qwenasr audio.wav --backend torch --cuda-graph-stride 64
-qwenasr audio1.wav audio2.wav --size 1.7B --backend vllm --json
-qwenasr audio.wav --language English --context "Preserve spelling: CUDA, FFmpeg"
-qwenasr audio.wav --size 0.6B --local-files-only
-```
-
-## C++ CLI
-
-The repo also contains a qwentts.cpp-style C ABI and `qwen-asr` C++ CLI under
-`src/` and `tools/`. The current C++ target is a bridge: it embeds Python and
-calls the package backend through the C ABI, which gives a buildable C++
-harness for benchmarking and for replacing the internals with a native GGML
-runtime.
+## Build
 
 ```bash
 git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-
-./build/qwen-asr sample.wav \
-  --size 0.6B \
-  --backend torch \
-  --dtype bf16 \
-  --language English \
-  --python-path "$PWD:/path/to/venv/lib/python3.12/site-packages"
 ```
+
+The native GGML build enables CUDA by default through `QWENASR_GGML_CUDA=ON`.
+Scheduled GGML tools use `--device auto` by default, which picks a GPU backend
+when one is registered and keeps a CPU backend in the scheduler for fallback
+ops. Use `--device gpu` to require GPU execution, `--device cpu` to force the
+CPU backend, or configure with `-D QWENASR_GGML_CUDA=OFF` for a CPU-only build.
+The scheduled audio encoder tries a combined audio-CNN-plus-encoder graph first
+so full chunks can avoid a GPU-to-CPU-to-GPU intermediate copy. Tool output
+prints `audio_path=combined` or `audio_path=two-stage`; set
+`QWENASR_GGML_COMBINED_AUDIO=0` to force the older two-stage path. The
+experimental `QWENASR_GGML_FLASH_ATTN=1` path is available for attention
+testing but is off by default.
 
 The native converter surface is started in `convert.py`. `--dry-run` validates
 the full HF -> native tensor-name map for both model sizes, and
@@ -182,14 +121,17 @@ python benchmarks/check_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-
 
 The pre-transformer audio prep boundary adds sinusoidal positional embeddings,
 packs only valid per-chunk frames, and reports the attention segments consumed
-by the audio transformer. `--backend sched` keeps the audio CNN weights in a
-persistent GGML CPU backend buffer:
+by the audio transformer. The default `--backend sched --device auto` path
+keeps the audio CNN weights in a persistent GGML backend buffer, prefers a GPU
+backend when available, and keeps the original per-call `--backend ggml` path
+for correctness comparisons:
 
 ```bash
 ./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --out audio-prep.f32
-./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --backend sched --out audio-prep-sched.f32
-python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav
-python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --native-backend sched
+./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --backend ggml --out audio-prep-ggml.f32
+./build/qwen-asr-audio-prep qwen3-asr-0.6b-audio-cnn.gguf sample.wav --device gpu --out audio-prep-gpu.f32
+python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --native-backend ggml
+python benchmarks/check_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --native-backend sched --native-device gpu --atol 2e-3
 ```
 
 The first audio transformer block is available in `qwen-asr-audio-layer`. It
@@ -205,132 +147,83 @@ python benchmarks/check_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-a
 The full native audio encoder path is available as `qwen-asr-audio-encoder`.
 It runs the audio CNN, all audio transformer layers, `ln_post`, and the two
 projector layers, producing the 1024-wide audio embeddings consumed by the
-Qwen3 text decoder. The default `--backend ggml` path is the original
-correctness-first implementation. The `--backend sched` path keeps the audio
-CNN, transformer, and projector weights in persistent GGML CPU backend buffers
-and runs the hot path through scheduler graphs:
+Qwen3 text decoder. The default `--backend sched --device auto` path keeps the
+audio CNN, transformer, and projector weights in persistent GGML backend
+buffers and runs the hot path through scheduler graphs on GPU when available.
+The original correctness-first implementation remains available as
+`--backend ggml`:
 
 ```bash
 ./build/qwen-asr-audio-encoder qwen3-asr-0.6b-audio-full.gguf sample.wav --out audio-encoder.f32
-./build/qwen-asr-audio-encoder qwen3-asr-0.6b-audio-full.gguf sample.wav --backend sched --out audio-encoder-sched.f32
-python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav
-python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --native-backend sched
+./build/qwen-asr-audio-encoder qwen3-asr-0.6b-audio-full.gguf sample.wav --backend ggml --out audio-encoder-ggml.f32
+./build/qwen-asr-audio-encoder qwen3-asr-0.6b-audio-full.gguf sample.wav --device gpu --out audio-encoder-gpu.f32
+python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --native-backend ggml
+python benchmarks/check_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --native-backend sched --native-device gpu
 ```
 
 The decoder input assembly boundary is available as `qwen-asr-decoder-input`.
 It looks up prompt token embeddings, replaces `<|audio_pad|>` positions with
 the native audio encoder output, and emits the embeddings passed into the Qwen3
-text decoder. It also supports `--audio-backend sched` to reuse the scheduled
-audio CNN, transformer, and projector backend:
+text decoder. Its default `--audio-backend sched --device auto` path reuses the
+scheduled audio CNN, transformer, and projector backend, while
+`--audio-backend ggml` keeps the original per-call audio path available:
 
 ```bash
 ./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --out decoder-input.f32
-./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --audio-backend sched --out decoder-input-sched.f32
-python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English
-python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --native-audio-backend sched
+./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --audio-backend ggml --out decoder-input-ggml.f32
+./build/qwen-asr-decoder-input qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --device gpu --out decoder-input-gpu.f32
+python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --native-audio-backend ggml
+python benchmarks/check_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --native-audio-backend sched --native-device gpu
 ```
 
 The first Qwen3 text decoder block and full prompt prefill logits are available
 as `qwen-asr-text-layer`. It builds the decoder input embeddings, then runs
 Qwen3 blocks with RMSNorm, Q/K/V projection, per-head Q/K RMSNorm, RoPE,
 grouped-query causal attention, output projection, and SwiGLU MLP. Layer mode
-supports `--backend scalar`, a correctness-first per-call `--backend ggml`
-graph, and a qwentts.cpp-style `--backend sched` graph that uploads layer
-weights into a GGML CPU backend buffer once. `--prefill` runs every text block
-plus the output RMSNorm and LM head, returning the next-token logits from the
-final prompt position; it supports the scalar text path and `--backend sched`.
-`--generate N` adds a minimal greedy loop that decodes generated token ids back
-to text; `--kv-cache` keeps per-layer K/V tensors from prompt prefill and runs
-following tokens through a one-row cached decode. It supports the scalar path
-and `--backend sched`, where the K/V cache is stored in backend tensors and each
-step appends through GGML graph-side cache writes:
+defaults to a qwentts.cpp-style `--backend sched --device auto` graph that
+uploads layer weights into a GGML backend buffer once and prefers GPU execution
+when available. `--backend scalar` and the correctness-first per-call
+`--backend ggml` graph remain available for comparisons. `--prefill` runs every
+text block plus the output RMSNorm and LM head, returning the next-token logits
+from the final prompt position. `--generate N` decodes generated token ids back
+to text; the scheduled backend uses KV cache automatically, storing K/V tensors
+in backend buffers and appending through GGML graph-side cache writes:
 
 ```bash
 ./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --out text-layer0.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --out text-layer0-sched.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend ggml --out text-layer0-ggml.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --audio-backend sched --backend sched --out text-layer0-backend.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --prefill --out next-token-logits.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --backend sched --prefill --out next-token-logits-sched.f32
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --out native-prefix.txt
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --generate 2 --kv-cache --out native-prefix-cache.txt
-./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --audio-backend sched --backend sched --generate 2 --kv-cache --out native-prefix-sched.txt
-python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --backend scalar --out text-layer0-scalar.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --backend ggml --out text-layer0-ggml.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --device gpu --out text-layer0-gpu.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --prefill --out next-token-logits.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --prefill --device gpu --out next-token-logits-gpu.f32
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --generate 2 --out native-prefix.txt
+./build/qwen-asr-text-layer qwen3-asr-0.6b-text-full.gguf sample.wav --language English --generate 2 --device gpu --out native-prefix-gpu.txt
+python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend scalar
 python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend ggml
-python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend sched
-python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English
-python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --native-backend sched
-python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2
-python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-decode-backend kv-cache
-python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-backend sched --native-decode-backend kv-cache
-```
-
-## Streaming
-
-Streaming is exposed when the vLLM backend is used:
-
-```python
-asr = from_pretrained(size="0.6B", backend="vllm", max_new_tokens=32)
-state = asr.init_streaming_state(language="English")
-
-for chunk in chunks_16k_float32:
-    state = asr.streaming_transcribe(chunk, state)
-    print(state.text)
-
-state = asr.finish_streaming_transcribe(state)
-print(state.text)
+python benchmarks/check_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --native-backend sched --native-device gpu --atol 2e-2
+python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --native-backend scalar
+python benchmarks/check_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --native-backend sched --native-device gpu --atol 3e-2
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 2 --native-backend scalar
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-backend scalar --native-decode-backend kv-cache
+python benchmarks/check_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --native-backend sched --native-decode-backend kv-cache --native-device gpu
 ```
 
 ## Benchmark
 
 ```bash
-python benchmarks/throughput.py sample.wav --size 0.6B --backend auto
-python benchmarks/throughput.py sample.wav --size 0.6B --local-files-only
-python benchmarks/throughput.py sample.wav --size 1.7B --backend torch --language English
-python benchmarks/throughput.py sample.wav --size 0.6B --backend torch --repeat 4
-python benchmarks/profile_torch.py sample.wav --size 0.6B --language English
-python benchmarks/compare_parakeet.py sample.wav --qwen-size 0.6B
-python benchmarks/compare_cpp.py sample.wav --size 0.6B --backend torch --language English
 python benchmarks/bench_audio_conv0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-conv0.gguf sample.wav --torch-device cpu
 python benchmarks/bench_audio_cnn.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
-python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --torch-device cpu
+python benchmarks/bench_audio_prep.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-cnn.gguf sample.wav --cpp-devices gpu cpu --torch-device cpu
 python benchmarks/bench_audio_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-layer0.gguf sample.wav --torch-device cpu
-python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --torch-device cpu
-python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --torch-device cpu
-python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --cpp-backends scalar ggml sched --torch-device cpu
-python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --cpp-backends scalar sched --torch-device cpu
-python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-backends scalar sched --cpp-decode-backends kv-cache --torch-device cpu
+python benchmarks/bench_audio_encoder.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-audio-full.gguf sample.wav --cpp-devices gpu cpu --torch-device cpu
+python benchmarks/bench_decoder_input.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-decoder-input.gguf sample.wav --language English --cpp-devices gpu cpu --torch-device cpu
+python benchmarks/bench_text_layer0.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-layer0.gguf sample.wav --language English --cpp-backends scalar ggml sched --cpp-devices gpu cpu --torch-device cpu
+python benchmarks/bench_text_prefill.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --cpp-backends scalar sched --cpp-devices gpu cpu --torch-device cpu
+python benchmarks/bench_text_generate.py /path/to/Qwen3-ASR-0.6B-snapshot qwen3-asr-0.6b-text-full.gguf sample.wav --language English --max-new-tokens 4 --cpp-backends scalar sched --cpp-devices gpu cpu --cpp-decode-backends kv-cache --torch-device cpu
 ```
 
-RTF is reported as `audio_duration / wall_time`; values above 1 are faster than
-real time.
-
-See `examples/transcribe.py` for the minimal file path flow and
-`examples/streaming.py` for a vLLM streaming loop.
-
-Current GB10 smoke numbers on `/tmp/qwen-asr-ref/samples/jfk.wav` with cached
-BF16 weights, synchronized CUDA timing, and the default 128-token CUDA graph
-bucket:
-
-| Model | Backend | Language | Best Time | RTF |
-|---|---|---|---:|---:|
-| Qwen3-ASR-0.6B | torch + CUDA graph | auto | 0.329s | 33.5x |
-| Qwen3-ASR-0.6B | torch + CUDA graph | English | 0.299s | 36.8x |
-| Qwen3-ASR-0.6B | torch + CUDA graph, fp16 | English | 0.294s | 37.4x |
-| Qwen3-ASR-0.6B | torch batched fallback, 4 clips | English | 0.391s | 112.4x |
-| Qwen3-ASR-0.6B | C++ bridge -> torch + CUDA graph | English | 0.340s | 32.4x |
-| Qwen3-ASR-1.7B | torch + CUDA graph | English | 0.644s | 17.1x |
-| nano-parakeet | PyTorch | auto | 0.028s | 397.2x |
-
-Qwen3-ASR is still much more autoregressive work than Parakeet TDT on short
-clips, so the next major speed target is reducing the per-token decoder cost
-further or using a vLLM backend where available.
-
-For the 0.6B English JFK run, `benchmarks/profile_torch.py` reports a
-single-chunk stage breakdown of roughly 1 ms audio loading/chunking, 10 ms
-processor prep, 25 ms audio/text prefill, and 261 ms CUDA graph decoding for 26
-generated tokens. The current bottleneck is therefore the Qwen decoder's
-single-token autoregressive loop, not Python tokenization or audio loading.
+These scripts use Torch only as a reference implementation and timing baseline;
+the native implementation under test is in C++/GGML.
 
 The native conv0 microbenchmark on the same clip currently shows the first GGML
 graph path is correct but not yet competitive: with 8 CPU threads,
@@ -347,11 +240,11 @@ not yet an end-to-end speed win.
 
 At the packed pre-transformer boundary, `benchmarks/bench_audio_prep.py`
 measured roughly 774-874 ms for the original C++ GGML path with 8 CPU threads,
-435-462 ms with `--backend sched`, 99 ms for Torch CPU FP32, and 2.54 ms for
-Torch CUDA BF16. The output matches PyTorch at `1.53e-5` max absolute error and
-produces the JFK attention segments `[(0, 104), (104, 39)]`. A direct
-`qwen-asr-audio-prep --backend sched` run reported about 17 ms of one-time
-backend initialization and 450 ms hot prep time.
+435-462 ms with `--backend sched --device cpu`, 99 ms for Torch CPU FP32, and
+2.54 ms for Torch CUDA BF16. The output matches PyTorch at `1.53e-5` max
+absolute error and produces the JFK attention segments `[(0, 104), (104, 39)]`.
+With GGML CUDA enabled, `--backend sched --device gpu` measured about 185 ms
+hot prep time with expected CUDA numeric drift under `2e-3`.
 
 For the first audio encoder block, `benchmarks/bench_audio_layer0.py` measured
 roughly 1.09-1.18 s best for the native GGML graph, 1.37 s for the scalar CPU
@@ -366,51 +259,57 @@ original per-layer native GGML loop is correctness-first and slow; the
 qwentts.cpp-style scheduler path uploads CNN/transformer/projector weights once
 and removes the frontend and per-layer context rebuild/copy costs. On JFK with
 8 CPU threads, `benchmarks/bench_audio_encoder.py` measured roughly 7.5-8.2 s
-for the original C++ GGML path, 0.61-0.62 s for `--backend sched`, 368 ms for
-Torch CPU FP32, and 6.88 ms for Torch CUDA BF16. A direct
-`qwen-asr-audio-encoder --backend sched` run reported about 244 ms of one-time
-backend initialization and 794 ms hot encoder time.
+for the original C++ GGML path, 0.61-0.62 s for `--backend sched --device cpu`,
+368 ms for Torch CPU FP32, and 6.88 ms for Torch CUDA BF16. With GGML CUDA
+enabled, a direct `qwen-asr-audio-encoder --backend sched --device gpu` run
+reported about 1.18 s of one-time backend/weight initialization and 178 ms hot
+encoder time, compared with 628 ms hot encoder time for `--device cpu` in the
+same CUDA-enabled build.
 
 For the decoder input assembly boundary, `benchmarks/check_decoder_input.py`
 matches the Torch prompt embedding plus `masked_scatter` path at `4.09e-6` max
 absolute error on JFK with English forced output. `benchmarks/bench_decoder_input.py`
 measured roughly 7.5-7.8 s for the original C++ GGML audio path with 8 CPU
-threads, 0.62-0.64 s with `--audio-backend sched`, 347 ms for Torch CPU FP32,
-and 7.23 ms for Torch CUDA BF16. A direct
-`qwen-asr-decoder-input --audio-backend sched` run reported about 184 ms of
-one-time backend initialization and 766 ms hot decoder-input time.
+threads, 0.62-0.64 s with `--audio-backend sched --device cpu`, 347 ms for
+Torch CPU FP32, and 7.23 ms for Torch CUDA BF16. With GGML CUDA enabled, a
+direct `qwen-asr-decoder-input --audio-backend sched --device gpu` run reported
+about 196 ms hot decoder-input time.
 
 For the first Qwen3 text decoder block, `benchmarks/check_text_layer0.py`
 matches the eager Torch reference at `4.67e-5` max absolute error for the scalar
 path and `4.69e-5` for the GGML graph on JFK with English forced output.
 `benchmarks/bench_text_layer0.py` measured roughly 1.24 s best for the scalar
-C++ text block, 310 ms best for the per-call GGML graph, 20.7 ms best for the
-scheduled GGML backend after a 14.0 ms one-time text weight upload, and 14.4 ms
-best for Torch CPU FP32 with 8 threads. The scheduled GGML layer is now close to
-Torch CPU for this prompt-sized block and much faster than the current scalar
-C++ layer; the next native decoder work is extending the reusable backend
-through KV-cache single-token decoding.
+C++ text block, 310 ms best for the per-call GGML graph, 21.1 ms best for
+`--backend sched --device cpu`, and 2.55 ms best for
+`--backend sched --device gpu` after a 63 ms one-time GPU text weight upload.
+Torch CPU FP32 with 8 threads measured 16.5 ms in the same run. The scheduled
+GPU layer is now substantially faster than the CPU paths for this prompt-sized
+block.
 
 For the full prompt prefill logits, `benchmarks/check_text_prefill.py` matches
 the eager Torch reference at `1.34e-4` max absolute error for the scalar path and
 `1.33e-4` for the scheduled GGML backend on JFK, and both agree on the first
-next-token id (`3036`). `benchmarks/bench_text_prefill.py` measured roughly
-34.9 s for scalar C++ full text prefill with 8 CPU threads, 494 ms for the
-scheduled GGML backend after a 781 ms one-time text weight upload, and 479 ms
-for Torch CPU FP32 with 8 threads. This now covers all decoder layers and the LM
-head in reusable native GGML/backend graphs; the next optimization target is a
-scheduled KV-cache single-token decode loop.
+next-token id (`3036`). The GPU scheduled path matches the same top token with
+larger CUDA numeric drift (`max_abs=0.0194` on JFK), so GPU validation uses
+`--atol 2e-2` for layer checks and `--atol 3e-2` for full prefill while still
+enforcing top-token agreement.
+`benchmarks/bench_text_prefill.py` measured roughly 34.9 s for scalar C++ full
+text prefill with 8 CPU threads, 481 ms for `--backend sched --device cpu`,
+22.5 ms for `--backend sched --device gpu` after a 1.87 s one-time GPU text
+weight upload, and 478 ms for Torch CPU FP32 with 8 threads.
 
 For greedy generation, `benchmarks/check_text_generate.py` matches the Torch
 reference for the first four JFK English tokens (`3036,773,11,847`, decoded as
 `And so, my`) with both the scalar and scheduled KV-cache native paths. The
 original recompute path took about 69.3 s for just two tokens. With scalar
 `--kv-cache`, a four-token run measured about 35.8 s with 8 CPU threads. With
-`--backend sched --kv-cache`, the same four-token run measured 585 ms after a
-742 ms one-time text weight/KV-cache initialization, compared with 1.98 s for
+`--backend sched --kv-cache --device cpu`, the same four-token run measured
+579 ms after a 768 ms one-time text weight/KV-cache initialization. With
+`--backend sched --kv-cache --device gpu`, it measured 67.4 ms after a 1.69 s
+one-time GPU text weight/KV-cache initialization, compared with 2.00 s for
 Torch CPU FP32 with 8 threads. This is now an end-to-end qwentts.cpp-style
 native audio-to-token/text path with scheduled GGML prompt prefill and
-single-token KV-cache decode.
+single-token KV-cache decode that primarily targets GPU when CUDA is enabled.
 
 ## Implementation Notes
 
@@ -422,27 +321,19 @@ transformer encoder and a Qwen3 decoder:
   -> windowed AuT encoder -> projector -> Qwen3 autoregressive decoder
 ```
 
-The current repo intentionally reuses the official Qwen3-ASR model registration
-for weight compatibility and prompt correctness. The next performance target is
-a lean native/Torch fast path that avoids the official transformers backend's
-per-sample audio encoder loop and adds a captured single-stream decoder path.
-
-The native C++ port target mirrors qwentts.cpp's shape: CMake build, C ABI,
-CLI tools, GGUF conversion, and a GGML runtime. The bridge currently validates
-the C++ surface and comparison harness, and the native path now covers GGUF
-metadata/tensor validation, Whisper log-mel features, audio geometry, and Qwen
-BPE prompt expansion. It also has a mapped GGUF tensor-data loader, validated
-scalar and GGML implementations of the first audio Conv2D layer, and a validated
-GGML implementation of the three-layer audio CNN plus `conv_out`, sinusoidal
-position embeddings, valid-frame packing, all audio transformer layers, post
-normalization, the audio projector, decoder input embedding assembly, and a
-qwentts.cpp-style scheduled backend for the audio CNN, transformer, and
-projector that is also wired through decoder input assembly. The Qwen3 text
-decoder is validated as a scalar CPU path through the first block and full
-prompt prefill logits, including final normalization and the LM head, plus a
-minimal greedy generation loop with byte-level BPE decode. The decoder also has
-qwentts.cpp-style scheduled GGML/backend graphs for one-layer checks, full
-prompt prefill logits, and KV-cache follow-up token decoding.
+The native C++ port target mirrors qwentts.cpp's shape: CMake build, CLI tools,
+GGUF conversion, and a GGML runtime. The native path covers GGUF
+metadata/tensor validation, Whisper log-mel features, audio geometry, Qwen BPE
+prompt expansion, mapped GGUF tensor-data loading, scalar and GGML
+implementations of the audio frontend, all audio transformer layers, decoder
+input embedding assembly, and qwentts.cpp-style scheduled backends that can
+target GGML CUDA with CPU scheduler fallback. The Qwen3 text decoder is
+validated as a scalar CPU path through the first block and full prompt prefill
+logits, including final normalization and the LM head, plus a minimal greedy
+generation loop with byte-level BPE decode. The decoder also has qwentts.cpp-style
+scheduled GGML/backend graphs for one-layer checks, full prompt prefill logits,
+and KV-cache follow-up token decoding, including GPU-first backend selection
+through `--device auto|cpu|gpu`.
 The remaining native work is to reuse the scheduled text backend across a
 longer-lived transcription API and extend that backend path through the
 remaining standalone frontend tools.

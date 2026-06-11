@@ -43,7 +43,7 @@ def _torch_dtype(name: str) -> torch.dtype:
     raise ValueError(f"unsupported dtype: {name}")
 
 
-def _bench_cpp(prep_bin: Path, gguf: Path, audio: Path, threads: int, repeat: int, backend: str) -> list[float]:
+def _bench_cpp(prep_bin: Path, gguf: Path, audio: Path, threads: int, repeat: int, backend: str, device: str) -> list[float]:
     times = []
     for _ in range(repeat):
         meta = _parse_kv(
@@ -56,6 +56,8 @@ def _bench_cpp(prep_bin: Path, gguf: Path, audio: Path, threads: int, repeat: in
                     str(threads),
                     "--backend",
                     backend,
+                    "--device",
+                    device,
                 ]
             )
         )
@@ -124,6 +126,7 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--cpp-backends", nargs="+", choices=("ggml", "sched"), default=["ggml", "sched"])
+    parser.add_argument("--cpp-devices", nargs="+", choices=("auto", "cpu", "gpu", "cuda"), default=["auto"])
     parser.add_argument("--torch-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--torch-threads", type=int, default=None)
@@ -148,10 +151,18 @@ def main() -> int:
     ]
     weights = {name: _load_checkpoint_tensor(args.checkpoint, tensor) for name, tensor in TENSORS.items()}
 
-    cpp_results = {
-        backend: _bench_cpp(prep_bin, args.gguf, args.audio, args.threads, args.repeat, backend)
-        for backend in args.cpp_backends
-    }
+    cpp_results = {}
+    for backend in args.cpp_backends:
+        for device in args.cpp_devices:
+            cpp_results[(backend, device)] = _bench_cpp(
+                prep_bin,
+                args.gguf,
+                args.audio,
+                args.threads,
+                args.repeat,
+                backend,
+                device,
+            )
     torch_times = _bench_torch(
         chunks,
         chunk_input_lengths,
@@ -169,10 +180,11 @@ def main() -> int:
     print(f"threads={args.threads}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    for backend, times in cpp_results.items():
+    for (backend, device), times in cpp_results.items():
         cpp_best, cpp_mean = _summarize(times)
-        print(f"cpp_{backend}_best_ms={cpp_best:.3f}")
-        print(f"cpp_{backend}_mean_ms={cpp_mean:.3f}")
+        prefix = f"cpp_{backend}_{device}"
+        print(f"{prefix}_best_ms={cpp_best:.3f}")
+        print(f"{prefix}_mean_ms={cpp_mean:.3f}")
     print(f"torch_best_ms={torch_best:.3f}")
     print(f"torch_mean_ms={torch_mean:.3f}")
     print("status=ok")

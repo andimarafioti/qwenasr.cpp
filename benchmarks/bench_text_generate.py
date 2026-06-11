@@ -29,6 +29,7 @@ def _bench_cpp(
     repeat: int,
     text_backend: str,
     audio_backend: str,
+    device: str,
     decode_backend: str,
     max_new_tokens: int,
     system: str,
@@ -48,6 +49,8 @@ def _bench_cpp(
             text_backend,
             "--audio-backend",
             audio_backend,
+            "--device",
+            device,
             "--generate",
             str(max_new_tokens),
         ]
@@ -142,6 +145,7 @@ def main() -> int:
     parser.add_argument("--language", default="")
     parser.add_argument("--cpp-backends", nargs="+", choices=("scalar", "sched"), default=["scalar"])
     parser.add_argument("--cpp-audio-backends", nargs="+", choices=("ggml", "sched"), default=["sched"])
+    parser.add_argument("--cpp-devices", nargs="+", choices=("auto", "cpu", "gpu", "cuda"), default=["auto"])
     parser.add_argument("--cpp-decode-backends", nargs="+", choices=("recompute", "kv-cache"), default=["kv-cache"])
     parser.add_argument("--torch-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
@@ -168,22 +172,24 @@ def main() -> int:
     cpp_results = {}
     for text_backend in args.cpp_backends:
         for audio_backend in args.cpp_audio_backends:
-            for decode_backend in args.cpp_decode_backends:
-                if text_backend == "sched" and decode_backend != "kv-cache":
-                    continue
-                cpp_results[(text_backend, audio_backend, decode_backend)] = _bench_cpp(
-                    text_bin,
-                    args.gguf,
-                    args.audio,
-                    args.threads,
-                    args.repeat,
-                    text_backend,
-                    audio_backend,
-                    decode_backend,
-                    args.max_new_tokens,
-                    args.system,
-                    args.language,
-                )
+            for device in args.cpp_devices:
+                for decode_backend in args.cpp_decode_backends:
+                    if text_backend == "sched" and decode_backend != "kv-cache":
+                        continue
+                    cpp_results[(text_backend, audio_backend, device, decode_backend)] = _bench_cpp(
+                        text_bin,
+                        args.gguf,
+                        args.audio,
+                        args.threads,
+                        args.repeat,
+                        text_backend,
+                        audio_backend,
+                        device,
+                        decode_backend,
+                        args.max_new_tokens,
+                        args.system,
+                        args.language,
+                    )
     torch_times = _bench_torch(
         x,
         layer_weights,
@@ -205,8 +211,8 @@ def main() -> int:
     print(f"layers={layers}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    for (text_backend, audio_backend, decode_backend), (generate_times, decoder_times, text_init_times) in cpp_results.items():
-        prefix = f"cpp_{text_backend}_{audio_backend}_{decode_backend.replace('-', '_')}"
+    for (text_backend, audio_backend, device, decode_backend), (generate_times, decoder_times, text_init_times) in cpp_results.items():
+        prefix = f"cpp_{text_backend}_{audio_backend}_{device}_{decode_backend.replace('-', '_')}"
         cpp_best, cpp_mean = _summarize(generate_times)
         decoder_best, decoder_mean = _summarize(decoder_times)
         text_init_best, text_init_mean = _summarize(text_init_times)

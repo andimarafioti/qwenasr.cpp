@@ -38,6 +38,7 @@ def _bench_cpp(
     threads: int,
     repeat: int,
     audio_backend: str,
+    device: str,
     system: str,
     language: str,
 ) -> list[float]:
@@ -51,6 +52,8 @@ def _bench_cpp(
             str(threads),
             "--audio-backend",
             audio_backend,
+            "--device",
+            device,
         ]
         if system:
             cmd += ["--system", system]
@@ -147,6 +150,7 @@ def main() -> int:
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
     parser.add_argument("--cpp-audio-backends", nargs="+", choices=("ggml", "sched"), default=["ggml", "sched"])
+    parser.add_argument("--cpp-devices", nargs="+", choices=("auto", "cpu", "gpu", "cuda"), default=["auto"])
     parser.add_argument("--torch-device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-dtype", choices=("fp32", "bf16", "fp16"), default="fp32")
     parser.add_argument("--torch-threads", type=int, default=None)
@@ -189,19 +193,20 @@ def main() -> int:
     }
     embeddings = _load_checkpoint_tensor(args.checkpoint, TEXT_EMBED_NAME)
 
-    cpp_results = {
-        backend: _bench_cpp(
-            decoder_bin,
-            args.gguf,
-            args.audio,
-            args.threads,
-            args.repeat,
-            backend,
-            args.system,
-            args.language,
-        )
-        for backend in args.cpp_audio_backends
-    }
+    cpp_results = {}
+    for backend in args.cpp_audio_backends:
+        for device in args.cpp_devices:
+            cpp_results[(backend, device)] = _bench_cpp(
+                decoder_bin,
+                args.gguf,
+                args.audio,
+                args.threads,
+                args.repeat,
+                backend,
+                device,
+                args.system,
+                args.language,
+            )
     torch_times = _bench_torch(
         chunks,
         chunk_input_lengths,
@@ -225,10 +230,11 @@ def main() -> int:
     print(f"heads={args.heads}")
     print(f"torch_device={args.torch_device}")
     print(f"torch_dtype={args.torch_dtype}")
-    for backend, times in cpp_results.items():
+    for (backend, device), times in cpp_results.items():
         cpp_best, cpp_mean = _summarize(times)
-        print(f"cpp_{backend}_best_ms={cpp_best:.3f}")
-        print(f"cpp_{backend}_mean_ms={cpp_mean:.3f}")
+        prefix = f"cpp_{backend}_{device}"
+        print(f"{prefix}_best_ms={cpp_best:.3f}")
+        print(f"{prefix}_mean_ms={cpp_mean:.3f}")
     print(f"torch_best_ms={torch_best:.3f}")
     print(f"torch_mean_ms={torch_mean:.3f}")
     print("status=ok")

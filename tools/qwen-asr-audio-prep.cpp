@@ -16,9 +16,10 @@
 static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out prep.f32] [--threads N]\n"
-        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--backend ggml|sched] [--device auto|cpu|gpu]\n"
         << "\n"
-        << "Run native Qwen3-ASR audio CNN, positional embedding, and valid-frame packing.\n";
+        << "Run native Qwen3-ASR audio CNN, positional embedding, and valid-frame packing.\n"
+        << "Defaults: --backend sched --device auto.\n";
 }
 
 static bool write_raw(const std::string & path, const std::vector<float> & values, std::string * error) {
@@ -50,7 +51,9 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string audio_path;
     std::string out_path;
-    std::string backend = "ggml";
+    std::string backend = "sched";
+    std::string error;
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto();
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -73,6 +76,17 @@ int main(int argc, char ** argv) {
             backend = argv[i];
             if (backend != "ggml" && backend != "sched") {
                 std::cerr << "--backend requires ggml or sched\n";
+                return 2;
+            }
+            continue;
+        }
+        if (arg == "--device") {
+            if (++i >= argc) {
+                std::cerr << "--device requires auto, cpu, or gpu\n";
+                return 2;
+            }
+            if (!qwenasr_ggml_device_from_string(argv[i], &device, &error)) {
+                std::cerr << error << "\n";
                 return 2;
             }
             continue;
@@ -108,7 +122,6 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    std::string error;
     QwenAsrNativeConfig cfg;
     if (!qwenasr_load_gguf_metadata(model_path.c_str(), false, &cfg, &error)) {
         std::cerr << error << "\n";
@@ -149,7 +162,8 @@ int main(int argc, char ** argv) {
                 n_threads,
                 static_cast<int>(cfg.audio_num_mel_bins),
                 &prep_backend,
-                &error)) {
+                &error,
+                device)) {
             qwenasr_gguf_model_close(&model);
             std::cerr << error << "\n";
             return 1;
@@ -185,6 +199,7 @@ int main(int argc, char ** argv) {
         std::chrono::duration<double, std::milli>(prep_end - prep_start).count();
 
     std::cout << "backend=" << backend << "\n";
+    std::cout << "device=" << qwenasr_ggml_device_name(device) << "\n";
     std::cout << "threads=" << n_threads << "\n";
     std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "prep_ms=" << prep_ms << "\n";

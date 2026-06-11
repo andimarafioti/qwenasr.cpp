@@ -7,9 +7,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
-find_package(Python3 REQUIRED COMPONENTS Development.Embed)
-
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
+option(QWENASR_GGML_CUDA "Build GGML with CUDA support for GPU-first native backends" ON)
+set(GGML_CUDA ${QWENASR_GGML_CUDA} CACHE BOOL "ggml: use CUDA" FORCE)
+set(GGML_CUDA_GRAPHS ${QWENASR_GGML_CUDA} CACHE BOOL "ggml: use CUDA graphs" FORCE)
 add_subdirectory(ggml)
 
 function(qwenasr_compile_options target)
@@ -20,16 +21,8 @@ function(qwenasr_compile_options target)
     endif()
 endfunction()
 
-add_library(qwenasr_bridge STATIC
-    src/qwenasr.cpp
-)
-target_include_directories(qwenasr_bridge PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_link_libraries(qwenasr_bridge PUBLIC Python3::Python)
-qwenasr_compile_options(qwenasr_bridge)
-
 add_library(qwenasr_native STATIC
+    src/ggml-backends.cpp
     src/native-model.cpp
     src/gguf-model.cpp
     src/audio-features.cpp
@@ -45,10 +38,6 @@ target_include_directories(qwenasr_native PUBLIC
 )
 target_link_libraries(qwenasr_native PUBLIC ggml)
 qwenasr_compile_options(qwenasr_native)
-
-add_executable(qwen-asr tools/qwen-asr.cpp)
-target_link_libraries(qwen-asr PRIVATE qwenasr_bridge)
-qwenasr_compile_options(qwen-asr)
 
 add_executable(qwen-asr-gguf-info tools/qwen-asr-gguf-info.cpp)
 target_link_libraries(qwen-asr-gguf-info PRIVATE qwenasr_native)

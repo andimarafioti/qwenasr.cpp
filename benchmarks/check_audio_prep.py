@@ -27,6 +27,7 @@ def _dump_native_prep(
     audio: Path,
     n_threads: int,
     backend: str,
+    device: str,
 ) -> tuple[np.ndarray, dict[str, str]]:
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -41,6 +42,8 @@ def _dump_native_prep(
                     str(n_threads),
                     "--backend",
                     backend,
+                    "--device",
+                    device,
                     "--out",
                     str(tmp_path),
                 ]
@@ -81,6 +84,7 @@ def main() -> int:
     parser.add_argument("--features-bin", default=str(ROOT / "build" / "qwen-asr-features"))
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--native-backend", choices=("ggml", "sched"), default="ggml")
+    parser.add_argument("--native-device", choices=("auto", "cpu", "gpu", "cuda"), default="auto")
     parser.add_argument("--atol", type=float, default=5e-4)
     args = parser.parse_args()
 
@@ -98,6 +102,7 @@ def main() -> int:
         args.audio,
         args.threads,
         args.native_backend,
+        args.native_device,
     )
     ref_chunks = _build_chunks(features, feature_meta)
 
@@ -153,6 +158,7 @@ def main() -> int:
     max_abs = float(diff.max())
     print(f"shape={native.shape}")
     print(f"native_backend={prep_meta['backend']}")
+    print(f"native_device={prep_meta.get('device', args.native_device)}")
     print(f"native_prep_ms={float(prep_meta['prep_ms']):.3f}")
     print(f"attention_segments={native_segments}")
     print(f"max_abs={max_abs:.8f}")

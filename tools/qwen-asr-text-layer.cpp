@@ -19,11 +19,12 @@ static void usage(const char * argv0) {
     std::cerr
         << "Usage: " << argv0 << " model.gguf audio.wav [--out text-layer0.f32] [--threads N]\n"
         << "       " << argv0 << " model.gguf audio.wav [--language NAME] [--system TEXT]\n"
-        << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched] [--backend scalar|ggml|sched] [--layer N]\n"
+        << "       " << argv0 << " model.gguf audio.wav [--audio-backend ggml|sched] [--backend scalar|ggml|sched] [--device auto|cpu|gpu] [--layer N]\n"
         << "       " << argv0 << " model.gguf audio.wav --prefill [--out next-token-logits.f32]\n"
         << "       " << argv0 << " model.gguf audio.wav --generate N [--kv-cache]\n"
         << "\n"
-        << "Run native Qwen3-ASR decoder input assembly, text prefill, or slow greedy generation.\n";
+        << "Run native Qwen3-ASR decoder input assembly, text prefill, or greedy generation.\n"
+        << "Defaults: --audio-backend sched --backend sched --device auto; generation uses KV cache.\n";
 }
 
 static bool write_raw(const std::string & path, const std::vector<float> & values, std::string * error) {
@@ -104,7 +105,9 @@ int main(int argc, char ** argv) {
     std::string language;
     std::string system_text;
     std::string audio_backend = "sched";
-    std::string text_backend = "scalar";
+    std::string text_backend = "sched";
+    std::string error;
+    QwenAsrGgmlDevice device = qwenasr_ggml_device_auto();
     bool prefill = false;
     bool use_kv_cache = false;
     int generate_tokens = -1;
@@ -184,6 +187,17 @@ int main(int argc, char ** argv) {
             }
             continue;
         }
+        if (arg == "--device") {
+            if (++i >= argc) {
+                std::cerr << "--device requires auto, cpu, or gpu\n";
+                return 2;
+            }
+            if (!qwenasr_ggml_device_from_string(argv[i], &device, &error)) {
+                std::cerr << error << "\n";
+                return 2;
+            }
+            continue;
+        }
         if (arg == "--layer") {
             if (++i >= argc) {
                 std::cerr << "--layer requires a non-negative integer\n";
@@ -232,6 +246,9 @@ int main(int argc, char ** argv) {
         std::cerr << "--prefill and --generate are mutually exclusive\n";
         return 2;
     }
+    if (generate_tokens >= 0 && text_backend == "sched") {
+        use_kv_cache = true;
+    }
     if (use_kv_cache && generate_tokens < 0) {
         std::cerr << "--kv-cache requires --generate\n";
         return 2;
@@ -240,16 +257,11 @@ int main(int argc, char ** argv) {
         std::cerr << "--backend ggml currently supports layer mode only\n";
         return 2;
     }
-    if (generate_tokens >= 0 && text_backend == "sched" && !use_kv_cache) {
-        std::cerr << "--backend sched generation requires --kv-cache\n";
-        return 2;
-    }
     if (prefill && text_backend == "ggml") {
         std::cerr << "--backend ggml currently supports layer mode only\n";
         return 2;
     }
 
-    std::string error;
     QwenAsrNativeConfig cfg;
     if (!qwenasr_load_gguf_metadata(model_path.c_str(), false, &cfg, &error)) {
         std::cerr << error << "\n";
@@ -289,6 +301,7 @@ int main(int argc, char ** argv) {
     auto decoder_start = std::chrono::steady_clock::now();
     auto decoder_end = decoder_start;
     bool decoder_ok = false;
+    std::string audio_path_name = "direct";
     if (audio_backend == "ggml") {
         decoder_ok = qwenasr_decoder_input_forward_ggml(
             model,
@@ -306,18 +319,7 @@ int main(int argc, char ** argv) {
         decoder_end = std::chrono::steady_clock::now();
     } else {
         const auto init_start = std::chrono::steady_clock::now();
-        QwenAsrAudioPrepBackend * prep_backend = nullptr;
         QwenAsrAudioEncoderBackend * encoder_backend = nullptr;
-        if (!qwenasr_audio_prep_backend_init(
-                model,
-                n_threads,
-                static_cast<int>(cfg.audio_num_mel_bins),
-                &prep_backend,
-                &error)) {
-            qwenasr_gguf_model_close(&model);
-            std::cerr << error << "\n";
-            return 1;
-        }
         if (!qwenasr_audio_encoder_backend_init(
                 model,
                 n_threads,
@@ -326,8 +328,9 @@ int main(int argc, char ** argv) {
                 static_cast<int>(cfg.audio_d_model),
                 static_cast<int>(cfg.audio_output_dim),
                 &encoder_backend,
-                &error)) {
-            qwenasr_audio_prep_backend_free(prep_backend);
+                &error,
+                device,
+                static_cast<int>(cfg.audio_num_mel_bins))) {
             qwenasr_gguf_model_close(&model);
             std::cerr << error << "\n";
             return 1;
@@ -335,12 +338,40 @@ int main(int argc, char ** argv) {
         const auto init_end = std::chrono::steady_clock::now();
         init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
 
-        QwenAsrAudioPrepOutput prep;
         QwenAsrAudioEncoderOutput audio;
+        audio_path_name = "combined";
         decoder_start = std::chrono::steady_clock::now();
+        decoder_ok = qwenasr_audio_encoder_backend_forward_features(encoder_backend, features, &audio, &error);
+        decoder_end = std::chrono::steady_clock::now();
+        if (!decoder_ok) {
+            const auto prep_init_start = std::chrono::steady_clock::now();
+            QwenAsrAudioPrepBackend * prep_backend = nullptr;
+            if (!qwenasr_audio_prep_backend_init(
+                    model,
+                    n_threads,
+                    static_cast<int>(cfg.audio_num_mel_bins),
+                    &prep_backend,
+                    &error,
+                    device)) {
+                qwenasr_audio_encoder_backend_free(encoder_backend);
+                qwenasr_gguf_model_close(&model);
+                std::cerr << error << "\n";
+                return 1;
+            }
+            const auto prep_init_end = std::chrono::steady_clock::now();
+            init_ms += std::chrono::duration<double, std::milli>(prep_init_end - prep_init_start).count();
+
+            QwenAsrAudioPrepOutput prep;
+            audio_path_name = "two-stage";
+            decoder_start = std::chrono::steady_clock::now();
+            decoder_ok =
+                qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error) &&
+                qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &audio, &error);
+            decoder_end = std::chrono::steady_clock::now();
+            qwenasr_audio_prep_backend_free(prep_backend);
+        }
         decoder_ok =
-            qwenasr_audio_prep_backend_forward(prep_backend, features, &prep, &error) &&
-            qwenasr_audio_encoder_backend_forward(encoder_backend, prep, &audio, &error) &&
+            decoder_ok &&
             qwenasr_decoder_input_from_audio(
                 model,
                 tokenizer,
@@ -352,7 +383,6 @@ int main(int argc, char ** argv) {
                 &error);
         decoder_end = std::chrono::steady_clock::now();
         qwenasr_audio_encoder_backend_free(encoder_backend);
-        qwenasr_audio_prep_backend_free(prep_backend);
     }
     if (!decoder_ok) {
         qwenasr_gguf_model_close(&model);
@@ -385,7 +415,8 @@ int main(int argc, char ** argv) {
                 cfg.text_rope_theta,
                 cfg.text_rms_norm_eps,
                 &text_decoder_backend,
-                &error);
+                &error,
+                device);
             const auto text_init_end = std::chrono::steady_clock::now();
             text_init_ms = std::chrono::duration<double, std::milli>(text_init_end - text_init_start).count();
             if (!init_ok) {
@@ -457,6 +488,8 @@ int main(int argc, char ** argv) {
         std::cout << "mode=generate\n";
         std::cout << "decode_backend=" << (use_kv_cache ? "kv-cache" : "recompute") << "\n";
         std::cout << "audio_backend=" << audio_backend << "\n";
+        std::cout << "device=" << qwenasr_ggml_device_name(device) << "\n";
+        std::cout << "audio_path=" << audio_path_name << "\n";
         std::cout << "threads=" << n_threads << "\n";
         std::cout << "init_ms=" << init_ms << "\n";
         std::cout << "text_init_ms=" << text_init_ms << "\n";
@@ -504,7 +537,8 @@ int main(int argc, char ** argv) {
                 cfg.text_rope_theta,
                 cfg.text_rms_norm_eps,
                 &text_decoder_backend,
-                &error);
+                &error,
+                device);
             const auto text_init_end = std::chrono::steady_clock::now();
             text_init_ms = std::chrono::duration<double, std::milli>(text_init_end - text_init_start).count();
             if (!init_ok) {
@@ -569,6 +603,8 @@ int main(int argc, char ** argv) {
         std::cout << "backend=" << text_backend << "\n";
         std::cout << "mode=prefill\n";
         std::cout << "audio_backend=" << audio_backend << "\n";
+        std::cout << "device=" << qwenasr_ggml_device_name(device) << "\n";
+        std::cout << "audio_path=" << audio_path_name << "\n";
         std::cout << "threads=" << n_threads << "\n";
         std::cout << "init_ms=" << init_ms << "\n";
         std::cout << "text_init_ms=" << text_init_ms << "\n";
@@ -607,7 +643,8 @@ int main(int argc, char ** argv) {
             cfg.text_rope_theta,
             cfg.text_rms_norm_eps,
             &text_layer_backend,
-            &error);
+            &error,
+            device);
         const auto text_init_end = std::chrono::steady_clock::now();
         text_init_ms = std::chrono::duration<double, std::milli>(text_init_end - text_init_start).count();
         if (!init_ok) {
@@ -677,6 +714,8 @@ int main(int argc, char ** argv) {
 
     std::cout << "backend=" << text_backend << "\n";
     std::cout << "audio_backend=" << audio_backend << "\n";
+    std::cout << "device=" << qwenasr_ggml_device_name(device) << "\n";
+    std::cout << "audio_path=" << audio_path_name << "\n";
     std::cout << "threads=" << n_threads << "\n";
     std::cout << "init_ms=" << init_ms << "\n";
     std::cout << "text_init_ms=" << text_init_ms << "\n";

@@ -20,6 +20,7 @@ def _dump_native_generate(
     n_threads: int,
     native_backend: str,
     audio_backend: str,
+    device: str,
     decode_backend: str,
     max_new_tokens: int,
     system: str,
@@ -35,6 +36,8 @@ def _dump_native_generate(
         native_backend,
         "--audio-backend",
         audio_backend,
+        "--device",
+        device,
         "--generate",
         str(max_new_tokens),
     ]
@@ -124,6 +127,7 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--native-backend", choices=("scalar", "sched"), default="scalar")
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
+    parser.add_argument("--native-device", choices=("auto", "cpu", "gpu", "cuda"), default="auto")
     parser.add_argument("--native-decode-backend", choices=("recompute", "kv-cache"), default="recompute")
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--system", default="")
@@ -146,6 +150,7 @@ def main() -> int:
         args.threads,
         args.native_backend,
         args.audio_backend,
+        args.native_device,
         args.native_decode_backend,
         args.max_new_tokens,
         args.system,
@@ -171,6 +176,8 @@ def main() -> int:
     print(f"native_text_init_ms={float(meta.get('text_init_ms', 0.0)):.3f}")
     print(f"native_generate_ms={float(meta['generate_ms']):.3f}")
     print(f"native_backend={meta['backend']}")
+    print(f"native_audio_backend={meta['audio_backend']}")
+    print(f"native_device={meta.get('device', args.native_device)}")
     print(f"native_decode_backend={meta['decode_backend']}")
     print(f"native_stopped={meta['stopped']}")
     if native_ids != torch_ids:

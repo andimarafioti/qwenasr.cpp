@@ -27,6 +27,7 @@ def _dump_native_prefill(
     n_threads: int,
     native_backend: str,
     audio_backend: str,
+    device: str,
     system: str,
     language: str,
 ) -> tuple[np.ndarray, dict[str, str]]:
@@ -43,6 +44,8 @@ def _dump_native_prefill(
             native_backend,
             "--audio-backend",
             audio_backend,
+            "--device",
+            device,
             "--prefill",
             "--out",
             str(tmp_path),
@@ -120,6 +123,7 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--native-backend", choices=("scalar", "sched"), default="scalar")
     parser.add_argument("--audio-backend", choices=("ggml", "sched"), default="sched")
+    parser.add_argument("--native-device", choices=("auto", "cpu", "gpu", "cuda"), default="auto")
     parser.add_argument("--system", default="")
     parser.add_argument("--language", default="")
     parser.add_argument("--atol", type=float, default=2e-3)
@@ -139,6 +143,7 @@ def main() -> int:
         args.threads,
         args.native_backend,
         args.audio_backend,
+        args.native_device,
         args.system,
         args.language,
     )
@@ -159,6 +164,7 @@ def main() -> int:
     print(f"layers={int(text_cfg['num_hidden_layers'])}")
     print(f"native_backend={meta['backend']}")
     print(f"native_audio_backend={meta['audio_backend']}")
+    print(f"native_device={meta.get('device', args.native_device)}")
     print(f"native_text_init_ms={float(meta.get('text_init_ms', 0.0)):.3f}")
     print(f"native_decoder_input_ms={float(meta['decoder_input_ms']):.3f}")
     print(f"native_prefill_ms={float(meta['prefill_ms']):.3f}")
